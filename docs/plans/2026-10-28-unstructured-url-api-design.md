@@ -2,7 +2,7 @@
 
 ## 目标
 
-在当前空目录创建一个独立 FastAPI 服务，通过 `POST /api/v1/parse` 接收 JSON 文档 URL，安全下载后用 Unstructured 0.27.x 解析，默认 CPU-only、非 OCR、PDF 使用 `fast` 策略。服务监听 `0.0.0.0`，默认端口 8000，仅供本机或已有内网/反向代理访问，不修改防火墙。
+在当前空目录创建一个独立 FastAPI 服务，通过 `POST /api/v1/parse` 接收 JSON 文档 URL，安全下载后用 Unstructured 解析，默认 CPU-only、非 OCR、PDF 使用 `fast` 策略。核实官方当前 0.27.35 后发现其 PDF 模块强制导入 `unstructured-inference`，会引入 Torch/视觉栈；为满足轻量约束，锁定仍支持同一 `partition()`/`fast` API 且已实测的 0.14.0。服务监听 `0.0.0.0`，默认端口 8000，仅供本机或已有内网/反向代理访问，不修改防火墙。
 
 ## 架构与数据流
 
@@ -14,7 +14,7 @@
 
 ## 格式和依赖
 
-锁定 Python 3.11、FastAPI、Uvicorn、`unstructured==0.27.35` 及 PDF/DOCX/PPTX/XLSX/CSV/Markdown 所需的轻量格式依赖。`.doc` 依赖 LibreOffice 转换，未安装时返回清晰错误；图片保持可识别但不启用 OCR/hi_res。由于 URL 先由服务层下载，Unstructured 原生 `url=` 不直接使用，以确保大小、重定向和 SSRF 约束可验证。
+锁定 Python 3.11、FastAPI、Uvicorn、`unstructured==0.14.0` 及 PDF/DOCX/PPTX/XLSX/CSV/Markdown 所需的格式依赖。PDF 需要 `pdfminer-six`、`pdf2image`、`pikepdf`、Pillow/HEIF 和 OpenCV 的解析支持，但不安装 `unstructured-inference`、Torch、CUDA 或模型。`.doc` 依赖 LibreOffice 转换，未安装时返回清晰错误；图片保持可识别但不启用 OCR/hi_res。由于 URL 先由服务层下载，Unstructured 原生 `url=` 不直接使用，以确保大小、重定向和 SSRF 约束可验证。
 
 ## 错误和安全
 
