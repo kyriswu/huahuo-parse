@@ -384,7 +384,6 @@ async def parse_document(request: ParseRequest) -> Dict[str, Any]:
     temp_path: Optional[str] = None
     started = time.perf_counter()
     try:
-        validate_remote_url(request.url)
         temp_path, display_name, extension = await run_in_threadpool(_download_document, request.url)
         result = await run_in_threadpool(
             _parse_document,

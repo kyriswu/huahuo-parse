@@ -6,6 +6,11 @@
 
 ```bash
 cd /root/huahuo-parse
+# 首次安装（系统已有 /root/.local/bin/python3.11）
+/root/.local/bin/python3.11 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python -m nltk.downloader punkt averaged_perceptron_tagger
+
 .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -19,6 +24,7 @@ cd /root/huahuo-parse
 ```
 
 配置示例见 `.env.example`。程序读取环境变量 `PORT`、`MAX_FILE_SIZE_MB`、`DOWNLOAD_TIMEOUT_SECONDS`、`MAX_REDIRECTS` 和 `LOG_LEVEL`；不会自动读取 `.env` 文件。
+如需使用 `.env`，可先执行 `set -a; source .env; set +a` 再启动。
 
 ## API
 
