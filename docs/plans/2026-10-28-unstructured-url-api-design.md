@@ -2,7 +2,7 @@
 
 ## 目标
 
-在当前空目录创建一个独立 FastAPI 服务，通过 `POST /api/v1/parse` 接收 JSON 文档 URL，安全下载后用 Unstructured 解析，默认 CPU-only、非 OCR、PDF 使用 `fast` 策略。核实官方当前 0.27.35 后发现其 PDF 模块强制导入 `unstructured-inference`，会引入 Torch/视觉栈；为满足轻量约束，锁定仍支持同一 `partition()`/`fast` API 且已实测的 0.14.0。服务监听 `0.0.0.0`，默认端口 8000，仅供本机或已有内网/反向代理访问，不修改防火墙。
+在当前空目录创建一个独立 FastAPI 服务，通过 `POST /api/v1/parse` 接收 JSON 文档 URL，安全下载后用 Unstructured 解析，默认 CPU-only、非 OCR、PDF 使用 `fast` 策略。核实官方当前 0.27.35 后发现其 PDF 模块强制导入 `unstructured-inference`，会引入 Torch/视觉栈；为满足轻量约束，锁定仍支持同一 `partition()`/`fast` API 且已实测的 0.14.0。服务监听 `0.0.0.0`，默认端口 4763，仅供本机或已有内网/反向代理访问，不修改防火墙。
 
 ## 架构与数据流
 

@@ -22,7 +22,7 @@ from starlette.concurrency import run_in_threadpool
 from unstructured.partition.auto import partition
 
 SERVICE_NAME = "unstructured-api"
-DEFAULT_PORT = 8000
+DEFAULT_PORT = 4763
 DEFAULT_DOWNLOAD_TIMEOUT = 20.0
 DEFAULT_MAX_REDIRECTS = 3
 SUPPORTED_EXTENSIONS = {

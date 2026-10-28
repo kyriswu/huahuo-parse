@@ -11,7 +11,7 @@ cd /root/huahuo-parse
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m nltk.downloader punkt averaged_perceptron_tagger
 
-.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 4763
 ```
 
 后台运行、查看日志、停止和重启：
@@ -31,13 +31,13 @@ cd /root/huahuo-parse
 健康检查：
 
 ```bash
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:4763/health
 ```
 
 解析远程文档：
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8000/api/v1/parse \
+curl -sS -X POST http://127.0.0.1:4763/api/v1/parse \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf","include_metadata":true,"include_elements":true}'
 ```
