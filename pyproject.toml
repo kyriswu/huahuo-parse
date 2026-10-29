@@ -1,0 +1,35 @@
+[project]
+name = "huahuo-parse"
+version = "0.1.0"
+description = "Secure URL-based Unstructured document parsing API"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "fastapi==0.115.14",
+    "uvicorn==0.35.0",
+    "unstructured==0.14.0",
+    "python-docx==1.2.0",
+    "python-pptx==1.0.2",
+    "openpyxl==3.1.5",
+    "xlrd==2.0.1",
+    "pandas==2.3.1",
+    "numpy==1.26.4",
+    "pdfminer-six==20231228",
+    "pypdf==4.3.1",
+    "pymupdf==1.26.7",
+    "oss2==2.19.1",
+    "markdown==3.10.1",
+    "pdf2image==1.17.0",
+    "pillow-heif==0.18.0",
+    "pikepdf==9.5.2",
+    "opencv-python-headless==4.10.0.84",
+    "networkx==3.3",
+    "nltk==3.8.1",
+]
+
+[tool.uv]
+package = false
+
+[tool.pyright]
+include = ["app", "tests"]
+pythonVersion = "3.11"
