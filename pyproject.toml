@@ -3,7 +3,7 @@ name = "huahuo-parse"
 version = "0.1.0"
 description = "Secure URL-based Unstructured document parsing API"
 readme = "README.md"
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "fastapi==0.115.14",
     "uvicorn==0.35.0",
@@ -32,4 +32,4 @@ package = false
 
 [tool.pyright]
 include = ["app", "tests"]
-pythonVersion = "3.11"
+pythonVersion = "3.12"

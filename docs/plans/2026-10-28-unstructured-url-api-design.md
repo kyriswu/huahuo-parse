@@ -14,7 +14,7 @@
 
 ## 格式和依赖
 
-锁定 Python 3.11、FastAPI、Uvicorn、`unstructured==0.14.0` 及 PDF/DOCX/PPTX/XLSX/CSV/Markdown 所需的格式依赖。PDF 需要 `pdfminer-six`、`pdf2image`、`pikepdf`、Pillow/HEIF 和 OpenCV 的解析支持，但不安装 `unstructured-inference`、Torch、CUDA 或模型。`.doc` 依赖 LibreOffice 转换，未安装时返回清晰错误；图片保持可识别但不启用 OCR/hi_res。由于 URL 先由服务层下载，Unstructured 原生 `url=` 不直接使用，以确保大小、重定向和 SSRF 约束可验证。
+锁定 Python 3.12、FastAPI、Uvicorn、`unstructured==0.14.0` 及 PDF/DOCX/PPTX/XLSX/CSV/Markdown 所需的格式依赖。PDF 需要 `pdfminer-six`、`pdf2image`、`pikepdf`、Pillow/HEIF 和 OpenCV 的解析支持，但不安装 `unstructured-inference`、Torch、CUDA 或模型。`.doc` 依赖 LibreOffice 转换，未安装时返回清晰错误；图片保持可识别但不启用 OCR/hi_res。由于 URL 先由服务层下载，Unstructured 原生 `url=` 不直接使用，以确保大小、重定向和 SSRF 约束可验证。
 
 ## 错误和安全
 

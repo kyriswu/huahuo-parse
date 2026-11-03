@@ -1,10 +1,10 @@
 # Unstructured URL 文档解析 API
 
-独立的 Python 3.11 + FastAPI + Uvicorn + Unstructured 服务。当前锁定 `unstructured==0.14.0` 和 `PyMuPDF==1.26.7`。PDF 使用 Unstructured 的 `fast` 策略提取原生文本，并使用 PyMuPDF 提取嵌入图片及页面坐标；本服务不启用 `hi_res`、`ocr_only` 或本地 OCR。`POST /api/v1/parse` 接收 JSON 文档 URL，服务端对每次请求做 DNS/SSRF 校验、限时流式下载到随机临时文件，解析后删除临时文件。
+独立的 Python 3.12 + FastAPI + Uvicorn + Unstructured 服务。当前锁定 `unstructured==0.14.0` 和 `PyMuPDF==1.26.7`。PDF 使用 Unstructured 的 `fast` 策略提取原生文本，并使用 PyMuPDF 提取嵌入图片及页面坐标；本服务不启用 `hi_res`、`ocr_only` 或本地 OCR。`POST /api/v1/parse` 接收 JSON 文档 URL，服务端对每次请求做 DNS/SSRF 校验、限时流式下载到随机临时文件，解析后删除临时文件。
 
 ## 项目管理与边界
 
-本项目使用 `uv` 管理 Python 3.11 环境和依赖，规范文件为 `pyproject.toml` 与 `uv.lock`；不再以手工 `pip install` 作为项目安装方式。服务是无状态的 URL 文档解析前置服务：不使用数据库，也不负责 RAG 切片、向量化或入库。若未来确实需要跨请求的轻量状态，优先考虑 Redis；当前识别缓存仅为有上限的进程内缓存，多进程之间不共享。
+本项目使用 `uv` 管理 Python 3.12 环境和依赖，规范文件为 `pyproject.toml` 与 `uv.lock`；不再以手工 `pip install` 作为项目安装方式。服务是无状态的 URL 文档解析前置服务：不使用数据库，也不负责 RAG 切片、向量化或入库。若未来确实需要跨请求的轻量状态，优先考虑 Redis；当前识别缓存仅为有上限的进程内缓存，多进程之间不共享。
 
 图片会在本服务内完成提取、OSS 保存、确定性过滤、SHA-256 精确去重和可选识别调度。图片说明和原生文本在 `markdown` 中先合并，后续 RAG 服务再进行切片和入库。
 
@@ -12,8 +12,8 @@
 
 ```bash
 cd /root/huahuo-parse
-# 首次安装（要求 Python 3.11）
-uv python install 3.11
+# 首次安装（要求 Python 3.12）
+uv python install 3.12
 uv sync --locked
 
 uv run uvicorn app.main:app --host 0.0.0.0 --port 4763
