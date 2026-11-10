@@ -5,7 +5,6 @@ import base64
 import concurrent.futures
 import hashlib
 import ipaddress
-import json
 import logging
 import mimetypes
 import os
@@ -26,7 +25,7 @@ os.environ.setdefault("UNSTRUCTURED_DISABLE_NOTICE", "1")
 import requests
 import fitz
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 from unstructured.partition.auto import partition
 
@@ -91,7 +90,6 @@ def _env_int(name: str, default: int) -> int:
 MAX_FILE_SIZE = _env_int("MAX_FILE_SIZE_MB", 50) * 1024 * 1024
 DOWNLOAD_TIMEOUT = _env_float("DOWNLOAD_TIMEOUT_SECONDS", DEFAULT_DOWNLOAD_TIMEOUT)
 MAX_REDIRECTS = _env_int("MAX_REDIRECTS", DEFAULT_MAX_REDIRECTS)
-MAX_PDF_PAGES = _env_int("MAX_PDF_PAGES", 100)
 MAX_PDF_IMAGES = _env_int("MAX_PDF_IMAGES", 100)
 MAX_PDF_TOTAL_IMAGE_BYTES = _env_int("MAX_PDF_TOTAL_IMAGE_MB", 100) * 1024 * 1024
 STORAGE_UPLOAD_CONCURRENCY = _env_int("STORAGE_UPLOAD_CONCURRENCY", 4)
@@ -124,13 +122,26 @@ _recognition_cache_lock = threading.Lock()
 
 
 class ParseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     url: str = Field(..., min_length=1, description="HTTP or HTTPS URL of a document")
-    include_metadata: bool = True
-    include_elements: bool = True
-    extract_images: bool = True
+    extract_images: bool = Field(
+        default=True,
+        description="Extract embedded PDF images and return markdown; when false, return text instead of markdown.",
+    )
+    max_pages: int = Field(
+        default=100,
+        ge=1,
+        description="Parse the first N PDF pages for text, images and Markdown; skip later pages without an error.",
+    )
     recognize_images: bool = False
     max_images: int = Field(default=100, ge=0, le=1000)
-    max_image_bytes: int = Field(default=10 * 1024 * 1024, ge=1, le=100 * 1024 * 1024)
+    max_image_bytes: int = Field(
+        default=10 * 1024 * 1024,
+        ge=1,
+        le=100 * 1024 * 1024,
+        description="Maximum bytes per extracted image; does not control the source document size.",
+    )
     filter_images: bool = True
     max_recognition_images: int = Field(default=MAX_RECOGNITION_IMAGES, ge=0, le=1000)
 
@@ -141,6 +152,16 @@ class ParseRequest(BaseModel):
         if not value:
             raise ValueError("url must not be empty")
         return value
+
+
+class MarkdownResponse(BaseModel):
+    markdown: str = Field(description="Document Markdown with image object keys and available OCR text.")
+    warnings: Optional[List[str]] = Field(default=None, description="Present only when content was truncated or processing was incomplete.")
+
+
+class TextResponse(BaseModel):
+    text: str = Field(description="Document plain text when image extraction is disabled.")
+    warnings: Optional[List[str]] = Field(default=None, description="Present only when content was truncated or processing was incomplete.")
 
 
 class StorageBackend(ABC):
@@ -319,19 +340,14 @@ def _download_document(url: str) -> Tuple[str, str, str]:
     try:
         for redirect_count in range(MAX_REDIRECTS + 1):
             validate_remote_url(current_url)
-            try:
-                response = session.get(
-                    current_url,
-                    stream=True,
-                    allow_redirects=False,
-                    timeout=(min(10.0, DOWNLOAD_TIMEOUT), DOWNLOAD_TIMEOUT),
-                    verify=True,
-                    headers={"User-Agent": "unstructured-api/1.0"},
-                )
-            except requests.Timeout as exc:
-                raise DownloadTimedOut("document download timed out") from exc
-            except requests.RequestException as exc:
-                raise DownloadError("document URL could not be fetched") from exc
+            response = session.get(
+                current_url,
+                stream=True,
+                allow_redirects=False,
+                timeout=(min(10.0, DOWNLOAD_TIMEOUT), DOWNLOAD_TIMEOUT),
+                verify=True,
+                headers={"User-Agent": "unstructured-api/1.0"},
+            )
             temp_path: Optional[str] = None
             try:
                 _validate_connected_peer(response)
@@ -381,45 +397,18 @@ def _download_document(url: str) -> Tuple[str, str, str]:
             finally:
                 response.close()
         raise DownloadError("too many redirects")
+    except requests.RequestException as exc:
+        # Streamed read timeouts are wrapped in ConnectionError by requests.
+        cause: Optional[BaseException] = exc
+        while cause is not None:
+            if isinstance(cause, (requests.Timeout, TimeoutError)):
+                logger.warning("document download timed out")
+                raise DownloadTimedOut("document download timed out") from exc
+            cause = cause.__cause__ or cause.__context__
+        logger.warning("document download failed: %s", type(exc).__name__)
+        raise DownloadError("document download failed") from exc
     finally:
         session.close()
-
-
-def _json_safe(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if hasattr(value, "isoformat"):
-        try:
-            return value.isoformat()
-        except Exception:
-            pass
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items() if key != "file_directory"}
-    if isinstance(value, (list, tuple, set)):
-        return [_json_safe(item) for item in value]
-    try:
-        json.dumps(value)
-        return value
-    except (TypeError, ValueError):
-        return str(value)
-
-
-def _element_metadata(element: Any, include_metadata: bool) -> Dict[str, Any]:
-    if not include_metadata:
-        return {}
-    metadata = getattr(element, "metadata", None)
-    if metadata is None:
-        return {}
-    try:
-        raw = metadata.to_dict() if hasattr(metadata, "to_dict") else dict(metadata)
-    except Exception:
-        raw = getattr(metadata, "__dict__", {})
-    if not isinstance(raw, dict):
-        return {}
-    raw.pop("file_directory", None)
-    raw.pop("filename", None)
-    raw.pop("metadata_file_path", None)
-    return _json_safe(raw)
 
 
 class VisionAdapter(ABC):
@@ -486,68 +475,69 @@ def _build_vision_adapter() -> VisionAdapter:
     return HTTPVisionAdapter(url, key, model)
 
 
-def _extract_pdf_images(path: str, image_dir: str, *, max_images: int, max_image_bytes: int, storage: Optional[StorageBackend] = None) -> Dict[str, Any]:
+def _extract_pdf_images(path: str, image_dir: str, *, max_images: int, max_image_bytes: int) -> Dict[str, Any]:
     images: List[Dict[str, Any]] = []
     errors: List[str] = []
     total_bytes = 0
+    resources: Dict[int, Optional[Dict[str, Any]]] = {}
     try:
-        document = fitz.open(path)
-        if len(document) > MAX_PDF_PAGES:
-            return {"status": "failed", "images": [], "count": 0, "errors": [f"PDF exceeds {MAX_PDF_PAGES} pages"]}
-        Path(image_dir).mkdir(parents=True, exist_ok=True)
-        for page_index in range(len(document)):
-            page = document[page_index]
-            page_image_number = 0
-            for info in page.get_image_info(xrefs=True):
-                if len(images) >= max_images or len(images) >= MAX_PDF_IMAGES:
-                    errors.append("image limit reached")
-                    break
-                xref = int(info.get("xref") or 0)
-                if not xref:
-                    errors.append(f"page {page_index + 1}: image has no xref")
-                    continue
-                try:
-                    extracted = document.extract_image(xref)
-                    image_bytes = extracted["image"]
-                    ext = str(extracted.get("ext") or "bin").lower()
-                    if len(image_bytes) > max_image_bytes:
-                        errors.append(f"page {page_index + 1}: image exceeds per-image limit")
+        with fitz.open(path) as document:
+            Path(image_dir).mkdir(parents=True, exist_ok=True)
+            for page_index in range(len(document)):
+                page = document[page_index]
+                page_image_number = 0
+                for info in page.get_image_info(xrefs=True):
+                    if len(images) >= max_images or len(images) >= MAX_PDF_IMAGES:
+                        errors.append("image limit reached")
+                        return {"status": "partial", "images": images, "count": len(images), "errors": errors}
+                    xref = int(info.get("xref") or 0)
+                    if not xref:
+                        errors.append(f"page {page_index + 1}: image has no xref")
                         continue
-                    if total_bytes + len(image_bytes) > MAX_PDF_TOTAL_IMAGE_BYTES:
-                        errors.append("PDF image byte budget reached")
-                        break
-                    page_image_number += 1
-                    filename = f"page-{page_index + 1}-image-{page_image_number}.{ext}"
-                    target = Path(image_dir) / filename
-                    target.write_bytes(image_bytes)
-                    object_key = f"{STORAGE_OSS_KEY_PREFIX + '/' if STORAGE_OSS_KEY_PREFIX else ''}pdf-images/{uuid.uuid4().hex}/{filename.rsplit('.', 1)[0]}"
-                    images.append({
-                        "image_id": f"page-{page_index + 1}-image-{page_image_number}",
-                        "page_number": page_index + 1,
-                        "bbox": [round(float(value), 3) for value in info["bbox"]],
-                        "width": int(extracted.get("width", info.get("width", 0))),
-                        "height": int(extracted.get("height", info.get("height", 0))),
-                        "page_width": round(float(page.rect.width), 3),
-                        "page_height": round(float(page.rect.height), 3),
-                        "format": ext,
-                        "resource_xref": xref,
-                        "has_mask": bool(info.get("has-mask", False)),
-                        "xres": info.get("xres"),
-                        "yres": info.get("yres"),
-                        "image_uri": f"images/{filename}",
-                        "_object_key": object_key,
-                        "_image_bytes": image_bytes,
-                        "ocr_status": "not_requested",
-                        "ocr_text": None,
-                        "recognition_status": "PENDING",
-                        "_path": str(target),
-                    })
-                    total_bytes += len(image_bytes)
-                except Exception as exc:
-                    errors.append(f"page {page_index + 1}: image extraction failed: {type(exc).__name__}")
-            if len(images) >= max_images or len(images) >= MAX_PDF_IMAGES:
-                break
-        document.close()
+                    try:
+                        if xref not in resources:
+                            resource = document.extract_image(xref)
+                            resources[xref] = resource if len(resource["image"]) <= max_image_bytes else None
+                        extracted = resources[xref]
+                        if extracted is None:
+                            errors.append(f"page {page_index + 1}: image exceeds per-image limit")
+                            continue
+                        image_bytes = extracted["image"]
+                        ext = str(extracted.get("ext") or "bin").lower()
+                        if total_bytes + len(image_bytes) > MAX_PDF_TOTAL_IMAGE_BYTES:
+                            errors.append("PDF image byte budget reached")
+                            return {"status": "partial", "images": images, "count": len(images), "errors": errors}
+                        page_image_number += 1
+                        filename = f"page-{page_index + 1}-image-{page_image_number}.{ext}"
+                        target = Path(image_dir) / filename
+                        target.write_bytes(image_bytes)
+                        object_key = f"{STORAGE_OSS_KEY_PREFIX + '/' if STORAGE_OSS_KEY_PREFIX else ''}pdf-images/{uuid.uuid4().hex}/{filename.rsplit('.', 1)[0]}"
+                        # PDFMiner coordinates include page rotation; use that frame for images too.
+                        bbox = fitz.Rect(info["bbox"]) * page.rotation_matrix
+                        images.append({
+                            "image_id": f"page-{page_index + 1}-image-{page_image_number}",
+                            "page_number": page_index + 1,
+                            "bbox": [round(float(value), 3) for value in bbox],
+                            "width": int(extracted.get("width", info.get("width", 0))),
+                            "height": int(extracted.get("height", info.get("height", 0))),
+                            "page_width": round(float(page.rect.width), 3),
+                            "page_height": round(float(page.rect.height), 3),
+                            "format": ext,
+                            "resource_xref": xref,
+                            "has_mask": bool(info.get("has-mask", False)),
+                            "xres": info.get("xres"),
+                            "yres": info.get("yres"),
+                            "image_uri": f"images/{filename}",
+                            "_object_key": object_key,
+                            "_image_bytes": image_bytes,
+                            "ocr_status": "not_requested",
+                            "ocr_text": None,
+                            "recognition_status": "PENDING",
+                            "_path": str(target),
+                        })
+                        total_bytes += len(image_bytes)
+                    except Exception as exc:
+                        errors.append(f"page {page_index + 1}: image extraction failed: {type(exc).__name__}")
     except Exception as exc:
         return {"status": "failed", "images": images, "count": len(images), "errors": [type(exc).__name__]}
     return {"status": "success" if not errors else "partial", "images": images, "count": len(images), "errors": errors}
@@ -629,7 +619,15 @@ def _filter_image_instances(images: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
 def _upload_pdf_images(images: List[Dict[str, Any]], storage: StorageBackend, *, max_workers: int = STORAGE_UPLOAD_CONCURRENCY) -> Tuple[List[Dict[str, Any]], List[str]]:
     errors: List[str] = []
-    workers = max(1, min(max_workers, len(images) or 1))
+    def resource_key(image: Dict[str, Any]) -> Tuple[str, str]:
+        if image.get("resource_hash"):
+            return "hash", image["resource_hash"]
+        return "object", image["_object_key"]
+
+    resources: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for image in images:
+        resources.setdefault(resource_key(image), image)
+    workers = max(1, min(max_workers, len(resources) or 1))
 
     def upload(image: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
         try:
@@ -646,11 +644,20 @@ def _upload_pdf_images(images: List[Dict[str, Any]], storage: StorageBackend, *,
             return image, f"{image.get('image_id', 'unknown')}: upload failed: {type(exc).__name__}"
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        results = list(executor.map(upload, images))
+        results = list(executor.map(upload, resources.values()))
+    uploaded: Dict[Tuple[str, str], str] = {}
     for image, error in results:
         if error:
             errors.append(error)
-    return [image for image, _ in results], errors
+        else:
+            uploaded[resource_key(image)] = image["image_uri"]
+    successful = []
+    for image in images:
+        key = resource_key(image)
+        if key in uploaded:
+            image["image_uri"] = uploaded[key]
+            successful.append(image)
+    return successful, errors
 
 
 def _recognize_images(images: List[Dict[str, Any]], adapter: VisionAdapter, *, recognize_images: bool) -> List[Dict[str, Any]]:
@@ -682,6 +689,7 @@ def _recognize_images_with_stats(images: List[Dict[str, Any]], adapter: VisionAd
                 if source:
                     if source.get("ocr_text"):
                         image["ocr_text"] = source["ocr_text"]
+                        image["ocr_status"] = source["ocr_status"]
                         image["recognition_status"] = "REUSE"
                         stats["reused"] += 1
                         continue
@@ -737,176 +745,138 @@ def _recognize_images_with_stats(images: List[Dict[str, Any]], adapter: VisionAd
     return images, stats
 
 
-def _markdown_for_result(text: str, elements: List[Dict[str, Any]], images: List[Dict[str, Any]]) -> str:
-    # Unstructured 0.14 elements often lack coordinates. Keep native text first
-    # and order image instances by their page and PDF top-left position.
-    lines = [text.strip()] if text.strip() else []
-    for image in sorted(images, key=lambda item: (item["page_number"], item["bbox"][1], item["bbox"][0])):
-        lines.append(f"![PDF 第 {image['page_number']} 页图片]({image['image_uri']})")
-        if image.get("ocr_status") == "success" and image.get("ocr_text"):
-            lines.append(f"> 图片识别文本：{image['ocr_text'].strip()}")
-    return "\n\n".join(line for line in lines if line)
-
-
-def _markdown_for_pdf(path: str, fallback_text: str, images: List[Dict[str, Any]]) -> str:
-    """Merge native PDF text blocks and image instances in PDF point order."""
-    items: List[Tuple[int, float, float, str]] = []
-    try:
-        document = fitz.open(path)
-        for page_index in range(len(document)):
-            page = document[page_index]
-            for block in page.get_text("blocks"):
-                text = str(block[4]).strip()
-                if text:
-                    items.append((page_index + 1, float(block[1]), float(block[0]), text))
-        document.close()
-    except Exception:
-        return _markdown_for_result(fallback_text, [], images)
-    for image in images:
-        items.append((image["page_number"], image["bbox"][1], image["bbox"][0], f"![PDF 第 {image['page_number']} 页图片]({image['image_uri']})"))
-        if image.get("ocr_status") == "success" and image.get("ocr_text"):
-            items.append((image["page_number"], image["bbox"][3], image["bbox"][0], f"> 图片识别文本：{image['ocr_text'].strip()}"))
-    if not items:
-        return fallback_text.strip()
-    return "\n\n".join(item[3] for item in sorted(items, key=lambda item: item[:3]))
-
-
-def _parse_document(path: str, display_name: str, extension: str, include_metadata: bool, include_elements: bool, *, extract_images: bool = True, recognize_images: bool = False, max_images: int = 100, max_image_bytes: int = 10 * 1024 * 1024, filter_images: bool = True, max_recognition_images: int = MAX_RECOGNITION_IMAGES) -> Dict[str, Any]:
-    started = time.perf_counter()
-    if extension in IMAGE_EXTENSIONS:
-        raise UnsupportedDocument(
-            "image parsing is disabled in the default CPU-only non-OCR mode; install and explicitly enable an image strategy separately"
+def _markdown_for_pdf(elements: List[Any], images: List[Dict[str, Any]]) -> str:
+    """Preserve Unstructured text order and insert images using page coordinates."""
+    def image_position(image: Dict[str, Any]) -> Tuple[int, float, float]:
+        return (
+            image["page_number"],
+            image["bbox"][1] / max(float(image["page_height"]), 1.0),
+            image["bbox"][0] / max(float(image["page_width"]), 1.0),
         )
-    kwargs: Dict[str, Any] = {"filename": path, "metadata_filename": display_name}
-    strategy = "native"
-    text_parse_error: Optional[str] = None
-    if extension in PDF_EXTENSIONS:
-        kwargs["strategy"] = "fast"
-        strategy = "fast"
-    try:
-        elements = partition(**kwargs)
-    except UnsupportedDocument as exc:
-        if extension in PDF_EXTENSIONS:
-            logger.warning("PDF native text parsing failed: %s", type(exc).__name__)
-            elements = []
-            text_parse_status = "failed"
-            text_parse_error = str(exc)
-        else:
-            raise
-    except Exception as exc:
-        if extension in PDF_EXTENSIONS:
-            logger.warning("PDF native text parsing failed: %s", type(exc).__name__)
-            elements = []
-            text_parse_status = "failed"
-            text_parse_error = str(exc)
-        else:
-            logger.warning("document parsing failed for %s: %s", extension, type(exc).__name__)
-            raise DownloadError("document parsing failed; the file may be damaged or missing a format dependency") from exc
-    else:
-        text_parse_status = "success" if elements else "success_empty"
-    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
-    text_parts: List[str] = []
-    serialized: List[Dict[str, Any]] = []
+
+    def image_markdown(image: Dict[str, Any]) -> str:
+        content = f"![PDF 第 {image['page_number']} 页图片]({image['image_uri']})"
+        if image.get("ocr_status") == "success" and image.get("ocr_text"):
+            quote = "\n".join("> " + line for line in ("图片识别文本：" + image["ocr_text"].strip()).splitlines())
+            content += "\n\n" + quote
+        return content
+
+    pending = sorted(images, key=image_position)
+    image_index = 0
+    page_number = 1
+    paragraphs: List[str] = []
     for element in elements:
         text = str(getattr(element, "text", "") or "")
-        if text:
-            text_parts.append(text)
-        if include_elements:
-            serialized.append({
-                "category": getattr(element, "category", element.__class__.__name__),
-                "text": text,
-                "metadata": _element_metadata(element, include_metadata),
-            })
-    merged_text = "\n\n".join(text_parts)
-    images: List[Dict[str, Any]] = []
-    image_extract_status = "not_applicable"
-    recognition_errors: List[str] = []
-    recognition_stats = {"estimated_api_calls": 0, "recognized": 0, "reused": 0, "skipped": 0, "candidate": 0}
-    image_dir: Optional[str] = None
-    image_extract_errors: List[str] = []
-    if extension in PDF_EXTENSIONS and extract_images:
-        image_dir = tempfile.mkdtemp(prefix="unstructured-images-")
-        extracted_images = _extract_pdf_images(
-            path,
-            image_dir,
-            max_images=max_images,
-            max_image_bytes=max_image_bytes,
-        )
-        image_extract_status = extracted_images["status"]
-        image_extract_errors = extracted_images["errors"]
-        images = extracted_images["images"]
-        if images:
-            if filter_images:
-                images = _filter_image_instances(images)
-            else:
-                for image in images:
-                    image["filter_status"] = "CANDIDATE"
-                    image["filter_reasons"] = []
-                    image["resource_hash"] = hashlib.sha256(_image_bytes(image)).hexdigest()
-                    image["perceptual_hash"] = None
-                    image["image_width"] = image.get("width", 0)
-                    image["image_height"] = image.get("height", 0)
-                    image["image_format"] = image.get("format")
-                    image["display_width"] = max(0.0, float(image.get("bbox", [0, 0, 0, 0])[2]) - float(image.get("bbox", [0, 0, 0, 0])[0]))
-                    image["display_height"] = max(0.0, float(image.get("bbox", [0, 0, 0, 0])[3]) - float(image.get("bbox", [0, 0, 0, 0])[1]))
-                    page_width, page_height = _page_geometry(image)
-                    image["page_area_ratio"] = round((image["display_width"] * image["display_height"]) / max(page_width * page_height, 1.0), 8)
-                    image["duplicate_of"] = None
-                    image["recognition_status"] = "PENDING"
-            images, upload_errors = _upload_pdf_images(images, _build_storage_backend())
-            image_extract_errors.extend(upload_errors)
-            if upload_errors and image_extract_status == "success":
-                image_extract_status = "partial"
-        images, recognition_stats = _recognize_images_with_stats(
-            images,
-            _build_vision_adapter(),
-            recognize_images=recognize_images,
-            max_recognition_images=max_recognition_images,
-        )
-        for image in images:
-            if image.get("ocr_status") in {"failed", "unconfigured"}:
-                recognition_errors.append(f"{image['image_id']}: {image.get('ocr_error', 'recognition failed')}")
-        public_images = [{key: value for key, value in image.items() if key not in {"_image_bytes", "_object_key", "_path"}} for image in images]
-    elif extension in PDF_EXTENSIONS:
-        image_extract_status = "disabled"
-        public_images = []
-    else:
-        public_images = []
-    result = {
-        "success": True,
-        "filename": display_name,
-        "file_type": extension.lstrip("."),
-        "strategy": strategy,
-        "duration_ms": elapsed_ms,
-        "element_count": len(elements),
-        "text_length": len(merged_text),
-        "text": merged_text,
-        "elements": serialized,
-        "text_parse_status": text_parse_status,
-        "text_parse_error": text_parse_error,
-        "image_extract_status": image_extract_status,
-        "image_extract_errors": image_extract_errors,
-        "images": public_images,
-        "image_count": len(public_images),
-        "recognized_image_count": sum(1 for image in public_images if image.get("ocr_status") == "success"),
-        "recognition_errors": recognition_errors,
-        "image_count_total": len(public_images),
-        "image_resource_count": len({image.get("resource_hash") for image in public_images if image.get("resource_hash")}),
-        "image_count_skipped": sum(1 for image in public_images if image.get("filter_status") == "SKIP"),
-        "image_count_candidate": sum(1 for image in public_images if image.get("filter_status") == "CANDIDATE"),
-        "image_count_reused": sum(1 for image in public_images if image.get("filter_status") == "REUSE" or image.get("recognition_status") in {"REUSE", "REUSED"}),
-        "image_count_recognized": recognition_stats["recognized"],
-        "estimated_api_calls": recognition_stats["estimated_api_calls"],
-        "filter_summary": {
-            reason: sum(1 for image in public_images if reason in image.get("filter_reasons", []))
-            for reason in sorted({reason for image in public_images for reason in image.get("filter_reasons", [])})
-        },
-        "markdown": _markdown_for_pdf(path, merged_text, public_images) if extension in PDF_EXTENSIONS else _markdown_for_result(merged_text, serialized, public_images),
-    }
-    if image_dir:
-        import shutil
-        shutil.rmtree(image_dir, ignore_errors=True)
-    return result
+        if not text:
+            continue
+        metadata = getattr(element, "metadata", None)
+        page_number = getattr(metadata, "page_number", None) or page_number
+        coordinates = getattr(metadata, "coordinates", None)
+        anchor: Optional[Tuple[float, float]] = None
+        if image_index < len(pending) and coordinates and coordinates.system and coordinates.points:
+            points = [coordinates.system.convert_to_relative(x, y) for x, y in coordinates.points]
+            # Unstructured relative coordinates use a bottom-left origin.
+            anchor = (1.0 - max(y for _, y in points), min(x for x, _ in points))
+        while image_index < len(pending):
+            image_page, image_y, image_x = image_position(pending[image_index])
+            if image_page > page_number:
+                break
+            if image_page == page_number and (anchor is None or (image_y, image_x) > anchor):
+                break
+            paragraphs.append(image_markdown(pending[image_index]))
+            image_index += 1
+        paragraphs.append(text)
+    paragraphs.extend(image_markdown(image) for image in pending[image_index:])
+    return "\n\n".join(paragraphs)
+
+
+def _parse_document(path: str, display_name: str, extension: str, *, max_pages: int = 100, extract_images: bool = True, recognize_images: bool = False, max_images: int = 100, max_image_bytes: int = 10 * 1024 * 1024, filter_images: bool = True, max_recognition_images: int = MAX_RECOGNITION_IMAGES) -> Dict[str, Any]:
+    warnings: List[str] = []
+    with tempfile.TemporaryDirectory(prefix="unstructured-parse-") as work_dir:
+        if extension in PDF_EXTENSIONS:
+            try:
+                with fitz.open(path) as document:
+                    total_pages = len(document)
+                    parsed_pages = min(total_pages, max_pages)
+                    if parsed_pages < total_pages:
+                        document.select(range(parsed_pages))
+                        path = str(Path(work_dir) / "pages.pdf")
+                        document.save(path, garbage=3)
+                        warnings.append(f"PDF contains {total_pages} pages; only the first {parsed_pages} pages were parsed")
+            except (fitz.FileDataError, RuntimeError, ValueError) as exc:
+                raise DownloadError("PDF pages could not be read; the file may be damaged or password-protected") from exc
+        if extension in IMAGE_EXTENSIONS:
+            raise UnsupportedDocument(
+                "image parsing is disabled in the default CPU-only non-OCR mode; install and explicitly enable an image strategy separately"
+            )
+        kwargs: Dict[str, Any] = {
+            "filename": path,
+            "metadata_filename": display_name,
+            # Coordinates are internal input for placing images, never response data.
+            "include_metadata": extension in PDF_EXTENSIONS and extract_images,
+        }
+        if extension in PDF_EXTENSIONS:
+            kwargs["strategy"] = "fast"
+        try:
+            elements = partition(**kwargs)
+        except Exception as exc:
+            logger.warning("document text parsing failed for %s: %s", extension, type(exc).__name__)
+            raise DownloadError("document text parsing failed; the file may be damaged or missing a format dependency") from exc
+        text_parts = [str(element.text) for element in elements if getattr(element, "text", None)]
+        merged_text = "\n\n".join(text_parts)
+        images: List[Dict[str, Any]] = []
+        if extension in PDF_EXTENSIONS and extract_images:
+            image_dir = str(Path(work_dir) / "images")
+            extracted_images = _extract_pdf_images(
+                path,
+                image_dir,
+                max_images=max_images,
+                max_image_bytes=max_image_bytes,
+            )
+            warnings.extend(extracted_images["errors"])
+            images = extracted_images["images"]
+            if images:
+                if filter_images:
+                    images = _filter_image_instances(images)
+                else:
+                    for image in images:
+                        image["filter_status"] = "CANDIDATE"
+                        image["filter_reasons"] = []
+                        image["resource_hash"] = hashlib.sha256(_image_bytes(image)).hexdigest()
+                        image["perceptual_hash"] = None
+                        image["image_width"] = image.get("width", 0)
+                        image["image_height"] = image.get("height", 0)
+                        image["image_format"] = image.get("format")
+                        image["display_width"] = max(0.0, float(image.get("bbox", [0, 0, 0, 0])[2]) - float(image.get("bbox", [0, 0, 0, 0])[0]))
+                        image["display_height"] = max(0.0, float(image.get("bbox", [0, 0, 0, 0])[3]) - float(image.get("bbox", [0, 0, 0, 0])[1]))
+                        page_width, page_height = _page_geometry(image)
+                        image["page_area_ratio"] = round((image["display_width"] * image["display_height"]) / max(page_width * page_height, 1.0), 8)
+                        image["duplicate_of"] = None
+                        image["recognition_status"] = "PENDING"
+                images, upload_errors = _upload_pdf_images(images, _build_storage_backend())
+                warnings.extend(upload_errors)
+            images, _ = _recognize_images_with_stats(
+                images,
+                _build_vision_adapter(),
+                recognize_images=recognize_images,
+                max_recognition_images=max_recognition_images,
+            )
+            for image in images:
+                if image.get("ocr_status") in {"failed", "unconfigured"}:
+                    warnings.append(f"{image['image_id']}: {image.get('ocr_error', 'recognition failed')}")
+                elif image.get("recognition_status") == "BUDGET_EXCEEDED":
+                    warnings.append("image recognition budget reached; some images were not recognized")
+        if extract_images:
+            result = {"markdown": (
+                _markdown_for_pdf(elements, images)
+                if extension in PDF_EXTENSIONS
+                else merged_text.strip()
+            )}
+        else:
+            result = {"text": merged_text}
+        if warnings:
+            result["warnings"] = list(dict.fromkeys(warnings))
+        return result
 
 
 app = FastAPI(title=SERVICE_NAME, version="1.0.0")
@@ -917,7 +887,12 @@ async def health() -> Dict[str, str]:
     return {"status": "ok", "service": SERVICE_NAME}
 
 
-@app.post("/api/v1/parse")
+@app.post(
+    "/api/v1/parse",
+    description="Returns only markdown (with image object keys and available OCR text), or text when extract_images is false. Warnings are included only for truncated or incomplete results.",
+    response_model=MarkdownResponse | TextResponse,
+    response_model_exclude_none=True,
+)
 async def parse_document(request: ParseRequest) -> Dict[str, Any]:
     temp_path: Optional[str] = None
     started = time.perf_counter()
@@ -928,8 +903,7 @@ async def parse_document(request: ParseRequest) -> Dict[str, Any]:
             temp_path,
             display_name,
             extension,
-            request.include_metadata,
-            request.include_elements,
+            max_pages=request.max_pages,
             extract_images=request.extract_images,
             recognize_images=request.recognize_images,
             max_images=request.max_images,
@@ -937,7 +911,7 @@ async def parse_document(request: ParseRequest) -> Dict[str, Any]:
             filter_images=request.filter_images,
             max_recognition_images=request.max_recognition_images,
         )
-        logger.info("parsed %s type=%s elements=%s duration_ms=%s", display_name, extension, result["element_count"], result["duration_ms"])
+        logger.info("parsed %s type=%s duration_ms=%s warnings=%s", display_name, extension, round((time.perf_counter() - started) * 1000, 2), len(result.get("warnings", [])))
         return result
     except DownloadError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc

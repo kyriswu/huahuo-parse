@@ -30,6 +30,7 @@
         "/api/v1/parse": {
             "post": {
                 "summary": "Parse Document",
+                "description": "Returns only markdown (with image object keys and available OCR text), or text when extract_images is false. Warnings are included only for truncated or incomplete results.",
                 "operationId": "parse_document_api_v1_parse_post",
                 "requestBody": {
                     "content": {
@@ -47,8 +48,14 @@
                         "content": {
                             "application/json": {
                                 "schema": {
-                                    "additionalProperties": true,
-                                    "type": "object",
+                                    "anyOf": [
+                                        {
+                                            "$ref": "#/components/schemas/MarkdownResponse"
+                                        },
+                                        {
+                                            "$ref": "#/components/schemas/TextResponse"
+                                        }
+                                    ],
                                     "title": "Response Parse Document Api V1 Parse Post"
                                 }
                             }
@@ -83,6 +90,35 @@
                 "type": "object",
                 "title": "HTTPValidationError"
             },
+            "MarkdownResponse": {
+                "properties": {
+                    "markdown": {
+                        "type": "string",
+                        "title": "Markdown",
+                        "description": "Document Markdown with image object keys and available OCR text."
+                    },
+                    "warnings": {
+                        "anyOf": [
+                            {
+                                "items": {
+                                    "type": "string"
+                                },
+                                "type": "array"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Warnings",
+                        "description": "Present only when content was truncated or processing was incomplete."
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "markdown"
+                ],
+                "title": "MarkdownResponse"
+            },
             "ParseRequest": {
                 "properties": {
                     "url": {
@@ -91,22 +127,87 @@
                         "title": "Url",
                         "description": "HTTP or HTTPS URL of a document"
                     },
-                    "include_metadata": {
+                    "extract_images": {
                         "type": "boolean",
-                        "title": "Include Metadata",
+                        "title": "Extract Images",
+                        "description": "Extract embedded PDF images and return markdown; when false, return text instead of markdown.",
                         "default": true
                     },
-                    "include_elements": {
+                    "max_pages": {
+                        "type": "integer",
+                        "minimum": 1.0,
+                        "title": "Max Pages",
+                        "description": "Parse the first N PDF pages for text, images and Markdown; skip later pages without an error.",
+                        "default": 100
+                    },
+                    "recognize_images": {
                         "type": "boolean",
-                        "title": "Include Elements",
+                        "title": "Recognize Images",
+                        "default": false
+                    },
+                    "max_images": {
+                        "type": "integer",
+                        "maximum": 1000.0,
+                        "minimum": 0.0,
+                        "title": "Max Images",
+                        "default": 100
+                    },
+                    "max_image_bytes": {
+                        "type": "integer",
+                        "maximum": 104857600.0,
+                        "minimum": 1.0,
+                        "title": "Max Image Bytes",
+                        "description": "Maximum bytes per extracted image; does not control the source document size.",
+                        "default": 10485760
+                    },
+                    "filter_images": {
+                        "type": "boolean",
+                        "title": "Filter Images",
                         "default": true
+                    },
+                    "max_recognition_images": {
+                        "type": "integer",
+                        "maximum": 1000.0,
+                        "minimum": 0.0,
+                        "title": "Max Recognition Images",
+                        "default": 20
                     }
                 },
+                "additionalProperties": false,
                 "type": "object",
                 "required": [
                     "url"
                 ],
                 "title": "ParseRequest"
+            },
+            "TextResponse": {
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "title": "Text",
+                        "description": "Document plain text when image extraction is disabled."
+                    },
+                    "warnings": {
+                        "anyOf": [
+                            {
+                                "items": {
+                                    "type": "string"
+                                },
+                                "type": "array"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Warnings",
+                        "description": "Present only when content was truncated or processing was incomplete."
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "text"
+                ],
+                "title": "TextResponse"
             },
             "ValidationError": {
                 "properties": {

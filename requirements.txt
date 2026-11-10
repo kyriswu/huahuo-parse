@@ -1,12 +1,15 @@
+-c requirements.lock.txt
+
 fastapi==0.115.14
 uvicorn==0.35.0
-unstructured==0.14.0
+unstructured==0.14.8
 python-docx==1.2.0
 python-pptx==1.0.2
 openpyxl==3.1.5
 xlrd==2.0.1
 pandas==2.3.1
-pdfminer-six==20231228
+numpy==1.26.4
+pdfminer-six==20240706
 pypdf==4.3.1
 PyMuPDF==1.26.7
 oss2==2.19.1
