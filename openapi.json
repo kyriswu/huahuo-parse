@@ -1,247 +1,206 @@
 {
-    "openapi": "3.1.0",
-    "info": {
-        "title": "unstructured-api",
-        "version": "1.0.0"
-    },
-    "paths": {
-        "/health": {
-            "get": {
-                "summary": "Health",
-                "operationId": "health_health_get",
-                "responses": {
-                    "200": {
-                        "description": "Successful Response",
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "additionalProperties": {
-                                        "type": "string"
-                                    },
-                                    "type": "object",
-                                    "title": "Response Health Health Get"
-                                }
-                            }
-                        }
-                    }
-                }
+  "openapi": "3.1.0",
+  "info": {
+    "title": "huahuo-parse",
+    "version": "2.0.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
             }
+          }
+        }
+      }
+    },
+    "/artifacts/{key}": {
+      "get": {
+        "summary": "Artifact",
+        "operationId": "artifact_artifacts__key__get",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/parse": {
+      "post": {
+        "summary": "Parse Document",
+        "description": "Fully parse every page into UTF-8 Markdown with native Office fields and source metadata.",
+        "operationId": "parse_document_api_v1_parse_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ParseRequest"
+              }
+            }
+          },
+          "required": true
         },
-        "/api/v1/parse": {
-            "post": {
-                "summary": "Parse Document",
-                "description": "Returns only markdown (with image object keys and available OCR text), or text when extract_images is false. Warnings are included only for truncated or incomplete results.",
-                "operationId": "parse_document_api_v1_parse_post",
-                "requestBody": {
-                    "content": {
-                        "application/json": {
-                            "schema": {
-                                "$ref": "#/components/schemas/ParseRequest"
-                            }
-                        }
-                    },
-                    "required": true
-                },
-                "responses": {
-                    "200": {
-                        "description": "Successful Response",
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "anyOf": [
-                                        {
-                                            "$ref": "#/components/schemas/MarkdownResponse"
-                                        },
-                                        {
-                                            "$ref": "#/components/schemas/TextResponse"
-                                        }
-                                    ],
-                                    "title": "Response Parse Document Api V1 Parse Post"
-                                }
-                            }
-                        }
-                    },
-                    "422": {
-                        "description": "Validation Error",
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "$ref": "#/components/schemas/HTTPValidationError"
-                                }
-                            }
-                        }
-                    }
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MarkdownResponse"
                 }
+              }
             }
-        }
-    },
-    "components": {
-        "schemas": {
-            "HTTPValidationError": {
-                "properties": {
-                    "detail": {
-                        "items": {
-                            "$ref": "#/components/schemas/ValidationError"
-                        },
-                        "type": "array",
-                        "title": "Detail"
-                    }
-                },
-                "type": "object",
-                "title": "HTTPValidationError"
-            },
-            "MarkdownResponse": {
-                "properties": {
-                    "markdown": {
-                        "type": "string",
-                        "title": "Markdown",
-                        "description": "Document Markdown with image object keys and available OCR text."
-                    },
-                    "warnings": {
-                        "anyOf": [
-                            {
-                                "items": {
-                                    "type": "string"
-                                },
-                                "type": "array"
-                            },
-                            {
-                                "type": "null"
-                            }
-                        ],
-                        "title": "Warnings",
-                        "description": "Present only when content was truncated or processing was incomplete."
-                    }
-                },
-                "type": "object",
-                "required": [
-                    "markdown"
-                ],
-                "title": "MarkdownResponse"
-            },
-            "ParseRequest": {
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "minLength": 1,
-                        "title": "Url",
-                        "description": "HTTP or HTTPS URL of a document"
-                    },
-                    "extract_images": {
-                        "type": "boolean",
-                        "title": "Extract Images",
-                        "description": "Extract embedded PDF images and return markdown; when false, return text instead of markdown.",
-                        "default": true
-                    },
-                    "max_pages": {
-                        "type": "integer",
-                        "minimum": 1.0,
-                        "title": "Max Pages",
-                        "description": "Parse the first N PDF pages for text, images and Markdown; skip later pages without an error.",
-                        "default": 100
-                    },
-                    "recognize_images": {
-                        "type": "boolean",
-                        "title": "Recognize Images",
-                        "default": false
-                    },
-                    "max_images": {
-                        "type": "integer",
-                        "maximum": 1000.0,
-                        "minimum": 0.0,
-                        "title": "Max Images",
-                        "default": 100
-                    },
-                    "max_image_bytes": {
-                        "type": "integer",
-                        "maximum": 104857600.0,
-                        "minimum": 1.0,
-                        "title": "Max Image Bytes",
-                        "description": "Maximum bytes per extracted image; does not control the source document size.",
-                        "default": 10485760
-                    },
-                    "filter_images": {
-                        "type": "boolean",
-                        "title": "Filter Images",
-                        "default": true
-                    },
-                    "max_recognition_images": {
-                        "type": "integer",
-                        "maximum": 1000.0,
-                        "minimum": 0.0,
-                        "title": "Max Recognition Images",
-                        "default": 20
-                    }
-                },
-                "additionalProperties": false,
-                "type": "object",
-                "required": [
-                    "url"
-                ],
-                "title": "ParseRequest"
-            },
-            "TextResponse": {
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "title": "Text",
-                        "description": "Document plain text when image extraction is disabled."
-                    },
-                    "warnings": {
-                        "anyOf": [
-                            {
-                                "items": {
-                                    "type": "string"
-                                },
-                                "type": "array"
-                            },
-                            {
-                                "type": "null"
-                            }
-                        ],
-                        "title": "Warnings",
-                        "description": "Present only when content was truncated or processing was incomplete."
-                    }
-                },
-                "type": "object",
-                "required": [
-                    "text"
-                ],
-                "title": "TextResponse"
-            },
-            "ValidationError": {
-                "properties": {
-                    "loc": {
-                        "items": {
-                            "anyOf": [
-                                {
-                                    "type": "string"
-                                },
-                                {
-                                    "type": "integer"
-                                }
-                            ]
-                        },
-                        "type": "array",
-                        "title": "Location"
-                    },
-                    "msg": {
-                        "type": "string",
-                        "title": "Message"
-                    },
-                    "type": {
-                        "type": "string",
-                        "title": "Error Type"
-                    }
-                },
-                "type": "object",
-                "required": [
-                    "loc",
-                    "msg",
-                    "type"
-                ],
-                "title": "ValidationError"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
             }
+          }
         }
+      }
     }
+  },
+  "components": {
+    "schemas": {
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "MarkdownResponse": {
+        "properties": {
+          "markdown": {
+            "type": "string",
+            "title": "Markdown"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Metadata"
+          },
+          "warnings": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Warnings"
+          }
+        },
+        "type": "object",
+        "required": [
+          "markdown",
+          "metadata"
+        ],
+        "title": "MarkdownResponse"
+      },
+      "ParseRequest": {
+        "properties": {
+          "file_url": {
+            "type": "string",
+            "minLength": 1,
+            "title": "File Url",
+            "description": "Direct download HTTP(S) URL, including its original signature"
+          },
+          "file_type": {
+            "type": "string",
+            "title": "File Type",
+            "description": "Declared file extension, for example pdf, docx, xlsx, pptx or png"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "file_url",
+          "file_type"
+        ],
+        "title": "ParseRequest"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
 }

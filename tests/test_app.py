@@ -1,704 +1,532 @@
-import os
+"""Contract regressions. Legacy 32-test baseline passed before the API migration."""
 import io
-import re
-import hashlib
-import time
-
+import os
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+os.environ['PRELOAD_MODEL'] = 'false'
+os.environ['PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK'] = 'True'
 
 import fitz
+import numpy as np
+from fastapi.testclient import TestClient
 from PIL import Image
 
-from fastapi.testclient import TestClient
-
 import app.main as main
+from app import parsing, vision
+from app.result import DocumentResult
+from app.storage import LocalStorageBackend
+from app.vision import engine, rewrite_images
 
 
-class _Handler(BaseHTTPRequestHandler):
-    payload = b"0123456789"
+def snapshot(text='recognized', label='text', bbox=None, width=200, height=200):
+    return {'res': {'input_path': 'document', 'page_index': 0, 'page_count': 1,
+                    'width': width, 'height': height, 'layout_det_res': {},
+                    'model_settings': {'use_layout_detection': True, 'use_doc_preprocessor': False,
+                                       'use_ocr_for_image_block': True, 'use_chart_recognition': True,
+                                       'use_seal_recognition': True, 'markdown_ignore_labels': []},
+                    'parsing_res_list': [{'block_label': label, 'block_content': text,
+                                          'block_bbox': bbox or [10, 10, 180, 180]}]}}
 
-    def do_GET(self):  # noqa: N802
-        self.send_response(200)
-        self.send_header("Content-Type", "application/pdf")
-        self.send_header("Content-Length", str(len(self.payload)))
-        self.end_headers()
-        self.wfile.write(self.payload)
 
-    def log_message(self, *_args):
-        pass
+def official_restructure(pages):
+    from paddlex.inference.pipelines.paddleocr_vl.pipeline import _PaddleOCRVLPipeline
+    pipeline = _PaddleOCRVLPipeline.__new__(_PaddleOCRVLPipeline)
+    return list(pipeline.restructure_pages(pages, merge_tables=True, relevel_titles=True))
+
+
+@contextmanager
+def server_for(handler):
+    server = HTTPServer(('127.0.0.1', 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with patch.object(main, 'validate_remote_url'), patch.object(main, '_validate_connected_peer'), patch.object(main, '_resolved_addresses', return_value=['127.0.0.1']):
+            yield f'http://127.0.0.1:{server.server_port}'
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 class AppTests(unittest.TestCase):
-    def test_rejects_ssrf_targets_and_non_http(self):
-        with self.assertRaises(main.URLRejected):
-            main.validate_remote_url("http://127.0.0.1/example.pdf")
-        with self.assertRaises(main.URLRejected):
-            main.validate_remote_url("file:///etc/passwd")
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.env = patch.dict(os.environ, {'STORAGE_LOCAL_ROOT': str(self.root / 'storage'), 'PRELOAD_MODEL': 'false'})
+        self.env.start()
+        self.client = TestClient(main.app)
+        self.client.__enter__()
 
-    def test_download_enforces_stream_limit(self):
-        server = HTTPServer(("127.0.0.1", 0), _Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        url = f"http://127.0.0.1:{server.server_port}/sample.pdf"
-        try:
-            with patch.object(main, "validate_remote_url"), patch.object(main, "MAX_FILE_SIZE", 4):
-                with self.assertRaises(main.DownloadTooLarge):
-                    main._download_document(url)
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=2)
+    def tearDown(self):
+        self.client.__exit__(None, None, None)
+        self.env.stop()
+        self.temp.cleanup()
 
-    def test_corrupt_pdf_signature_is_rejected(self):
-        fd, path = tempfile.mkstemp(suffix=".pdf")
-        os.write(fd, b"this is not a pdf")
-        os.close(fd)
-        try:
-            with self.assertRaises(main.DownloadError):
-                main._check_signature(path, ".pdf")
-        finally:
-            Path(path).unlink(missing_ok=True)
+    def result(self):
+        return DocumentResult('test', LocalStorageBackend(str(self.root / 'storage')))
 
-    def test_streaming_download_errors_return_gateway_status_and_clean_temp_files(self):
-        for failure, expected_status in (("timeout", 504), ("truncated", 502)):
-            with self.subTest(failure=failure):
-                release_body = threading.Event()
-
-                class Handler(BaseHTTPRequestHandler):
-                    def do_GET(self):
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/pdf")
-                        self.send_header("Content-Length", "100")
-                        self.end_headers()
-                        self.wfile.write(b"%PDF")
-                        self.wfile.flush()
-                        if failure == "timeout":
-                            release_body.wait(timeout=2)
-                        self.close_connection = True
-
-                    def log_message(self, *_args):
-                        pass
-
-                server = HTTPServer(("127.0.0.1", 0), Handler)
-                thread = threading.Thread(target=server.serve_forever, daemon=True)
-                thread.start()
-                try:
-                    with tempfile.TemporaryDirectory() as directory:
-                        with (
-                            patch.object(main, "validate_remote_url"),
-                            patch.object(main, "_validate_connected_peer"),
-                            patch.object(main, "DOWNLOAD_TIMEOUT", 0.1),
-                            patch.object(main.tempfile, "tempdir", directory),
-                            TestClient(main.app) as client,
-                        ):
-                            response = client.post(
-                                "/api/v1/parse",
-                                json={"url": f"http://127.0.0.1:{server.server_port}/sample.pdf"},
-                            )
-                        self.assertEqual(response.status_code, expected_status, response.text)
-                        self.assertEqual(
-                            response.json()["detail"],
-                            "document download timed out" if failure == "timeout" else "document download failed",
-                        )
-                        self.assertEqual(list(Path(directory).glob("unstructured-*")), [])
-                finally:
-                    release_body.set()
-                    server.shutdown()
-                    server.server_close()
-                    thread.join(timeout=2)
-
-    def test_pdf_images_keep_duplicate_instances_and_coordinates(self):
-        path = self._make_pdf(two_images=True)
-        image_dir = tempfile.mkdtemp()
-        try:
-            result = main._extract_pdf_images(path, image_dir, max_images=10, max_image_bytes=100000)
-            self.assertEqual(result["status"], "success")
-            self.assertEqual(result["count"], 2)
-            self.assertEqual([item["page_number"] for item in result["images"]], [1, 1])
-            self.assertEqual(result["images"][0]["image_id"], "page-1-image-1")
-            self.assertNotEqual(result["images"][0]["bbox"], result["images"][1]["bbox"])
-            self.assertTrue(Path(image_dir, "page-1-image-1.png").exists())
-        finally:
-            Path(path).unlink(missing_ok=True)
-            import shutil
-            shutil.rmtree(image_dir, ignore_errors=True)
-
-    def test_storage_backend_uses_extensionless_object_key(self):
-        path = self._make_pdf(two_images=False)
-        image_dir = tempfile.mkdtemp()
-
-        class Storage:
-            def __init__(self):
-                self.calls = []
-
-            def put(self, key, data, *, content_type):
-                self.calls.append((key, content_type, data))
-                return key
-
-        storage = Storage()
-        try:
-            result = main._extract_pdf_images(
-                path, image_dir, max_images=10, max_image_bytes=100000
-            )
-            result["images"], upload_errors = main._upload_pdf_images(result["images"], storage, max_workers=2)
-            self.assertEqual(result["count"], 1)
-            self.assertEqual(upload_errors, [])
-            self.assertEqual(len(storage.calls), 1)
-            self.assertNotIn(".", storage.calls[0][0].rsplit("/", 1)[-1])
-            self.assertEqual(result["images"][0]["image_uri"], storage.calls[0][0])
-        finally:
-            Path(path).unlink(missing_ok=True)
-            import shutil
-            shutil.rmtree(image_dir, ignore_errors=True)
-
-    def test_repeated_image_resource_is_extracted_and_uploaded_once(self):
-        path = self._make_pdf(two_images=True)
-        extraction_calls = []
-        original_extract = fitz.Document.extract_image
-
-        def extract(document, xref):
-            extraction_calls.append(xref)
-            return original_extract(document, xref)
-
-        class Storage:
-            def __init__(self):
-                self.keys = []
-
-            def put(self, key, data, *, content_type):
-                self.keys.append(key)
-                return key
-
-        try:
-            with tempfile.TemporaryDirectory() as image_dir:
-                with patch.object(fitz.Document, "extract_image", new=extract):
-                    extracted = main._extract_pdf_images(path, image_dir, max_images=10, max_image_bytes=100000)
-                self.assertEqual(len(extraction_calls), 1)
-                storage = Storage()
-                images = main._filter_image_instances(extracted["images"])
-                uploaded, errors = main._upload_pdf_images(images, storage)
-                self.assertEqual(errors, [])
-                self.assertEqual(len(storage.keys), 1)
-                self.assertEqual(len(uploaded), 2)
-                self.assertEqual(uploaded[0]["image_uri"], uploaded[1]["image_uri"])
-                self.assertNotEqual(uploaded[0]["bbox"], uploaded[1]["bbox"])
-        finally:
-            Path(path).unlink(missing_ok=True)
-
-    def test_image_coordinates_include_pdf_page_rotation(self):
-        path = self._make_pdf()
-        try:
-            with fitz.open(path) as document:
-                document[0].set_rotation(90)
-                document.saveIncr()
-            with tempfile.TemporaryDirectory() as image_dir:
-                extracted = main._extract_pdf_images(path, image_dir, max_images=10, max_image_bytes=100000)
-            self.assertEqual(extracted["status"], "success")
-            self.assertEqual(extracted["images"][0]["bbox"], [250.0, 20.0, 300.0, 120.0])
-            self.assertEqual(extracted["images"][0]["page_width"], 400.0)
-            self.assertEqual(extracted["images"][0]["page_height"], 300.0)
-        finally:
-            Path(path).unlink(missing_ok=True)
-
-    def test_storage_uploads_run_with_bounded_concurrency(self):
-        image_dir = tempfile.mkdtemp()
-        images = []
-        for index in range(4):
-            path = Path(image_dir, f"image-{index}.png")
-            path.write_bytes(b"image")
-            images.append({"_path": str(path), "_object_key": f"objects/{index}", "format": "png"})
-
-        class Storage:
-            def __init__(self):
-                self.active = 0
-                self.max_active = 0
-                self.lock = threading.Lock()
-
-            def put(self, key, data, *, content_type):
-                with self.lock:
-                    self.active += 1
-                    self.max_active = max(self.max_active, self.active)
-                time.sleep(0.03)
-                with self.lock:
-                    self.active -= 1
-                return key
-
-        storage = Storage()
-        try:
-            result, errors = main._upload_pdf_images(images, storage, max_workers=2)
-            self.assertEqual(errors, [])
-            self.assertEqual([image["image_uri"] for image in result], [f"objects/{i}" for i in range(4)])
-            self.assertGreaterEqual(storage.max_active, 2)
-            self.assertLessEqual(storage.max_active, 2)
-        finally:
-            import shutil
-            shutil.rmtree(image_dir, ignore_errors=True)
-
-    def test_image_filter_hashes_and_skips_small_images(self):
-        images = [
-            self._image_instance("small", b"small", width=20, height=20, bbox=(0, 0, 20, 20)),
-            self._image_instance("large", b"large", width=200, height=200, bbox=(30, 30, 230, 230)),
-        ]
-        result = main._filter_image_instances(images)
-        self.assertEqual(result[0]["resource_hash"], hashlib.sha256(b"small").hexdigest())
-        self.assertEqual(result[0]["filter_status"], "SKIP")
-        self.assertIn("width_below_minimum", result[0]["filter_reasons"])
-        self.assertEqual(result[1]["filter_status"], "CANDIDATE")
-
-    def test_exact_duplicate_keeps_instances_and_marks_reuse(self):
-        images = [
-            self._image_instance("first", b"same", page=1, bbox=(20, 20, 120, 120)),
-            self._image_instance("second", b"same", page=2, bbox=(20, 20, 120, 120)),
-        ]
-        result = main._filter_image_instances(images)
-        self.assertEqual(result[0]["filter_status"], "CANDIDATE")
-        self.assertEqual(result[1]["filter_status"], "REUSE")
-        self.assertEqual(result[1]["duplicate_of"], "first")
-
-    def test_repeated_header_resource_is_skipped_after_three_pages(self):
-        images = [
-            self._image_instance(f"logo-{page}", b"logo", page=page, bbox=(10, 10, 60, 40))
-            for page in (1, 2, 3)
-        ]
-        result = main._filter_image_instances(images)
-        self.assertTrue(all(item["filter_status"] == "SKIP" for item in result))
-        self.assertTrue(all("repeated_header_or_footer" in item["filter_reasons"] for item in result))
-
-    def test_recognition_only_calls_unique_candidates_and_reuses_duplicate(self):
-        images = [
-            self._image_instance("first", b"same", page=1, bbox=(20, 20, 120, 120)),
-            self._image_instance("second", b"same", page=2, bbox=(20, 20, 120, 120)),
-            self._image_instance("other", b"other", page=3, bbox=(20, 20, 120, 120)),
-        ]
-        images = main._filter_image_instances(images)
-
-        class Adapter(main.VisionAdapter):
-            def __init__(self):
-                self.calls = []
-
-            def cache_identity(self):
-                return "test-provider:test-model:v1"
-
-            async def recognize_image(self, image_bytes, *, mime_type, metadata=None):
-                self.calls.append(metadata["image_id"])
-                return {"status": "success", "text": f"text-{metadata['image_id']}"}
-
-        adapter = Adapter()
-        result, stats = main._recognize_images_with_stats(images, adapter, recognize_images=True, max_recognition_images=20)
-        self.assertEqual(adapter.calls, ["first", "other"])
-        self.assertEqual(result[1]["recognition_status"], "REUSE")
-        self.assertEqual(result[1]["ocr_text"], result[0]["ocr_text"])
-        self.assertEqual(result[1]["ocr_status"], "success")
-        self.assertEqual(stats["estimated_api_calls"], 2)
-
-    def test_recognition_cache_avoids_second_call(self):
-        image = self._image_instance("cached", b"cache-me", bbox=(20, 20, 120, 120))
-
-        class Adapter(main.VisionAdapter):
-            calls = 0
-
-            def cache_identity(self):
-                return "cache-test:model:v1"
-
-            async def recognize_image(self, image_bytes, *, mime_type, metadata=None):
-                self.calls += 1
-                return {"status": "success", "text": "cached result"}
-
-        adapter = Adapter()
-        main._recognize_images_with_stats(main._filter_image_instances([image]), adapter, recognize_images=True, max_recognition_images=20)
-        second_image = self._image_instance("cached-again", b"cache-me", bbox=(20, 20, 120, 120))
-        result, stats = main._recognize_images_with_stats(main._filter_image_instances([second_image]), adapter, recognize_images=True, max_recognition_images=20)
-        self.assertEqual(adapter.calls, 1)
-        self.assertEqual(result[0]["recognition_status"], "REUSED")
-        self.assertEqual(stats["estimated_api_calls"], 0)
-
-    def test_recognition_budget_stops_external_calls(self):
-        images = main._filter_image_instances([
-            self._image_instance("one", b"one", bbox=(20, 20, 120, 120)),
-            self._image_instance("two", b"two", bbox=(20, 20, 120, 120)),
-        ])
-
-        class Adapter(main.VisionAdapter):
-            def __init__(self):
-                self.calls = 0
-
-            def cache_identity(self):
-                return "budget-test:v1"
-
-            async def recognize_image(self, image_bytes, *, mime_type, metadata=None):
-                self.calls += 1
-                return {"status": "success", "text": "ok"}
-
-        adapter = Adapter()
-        result, stats = main._recognize_images_with_stats(images, adapter, recognize_images=True, max_recognition_images=1)
-        self.assertEqual(adapter.calls, 1)
-        self.assertEqual(stats["estimated_api_calls"], 1)
-        self.assertEqual(result[1]["recognition_status"], "BUDGET_EXCEEDED")
-
-    def _image_instance(self, image_id, data, *, page=1, width=200, height=200, bbox=(20, 20, 220, 220)):
-        return {
-            "image_id": image_id,
-            "page_number": page,
-            "bbox": list(bbox),
-            "width": width,
-            "height": height,
-            "format": "png",
-            "_image_bytes": data,
-            "_object_key": f"objects/{image_id}",
-            "_path": "",
-        }
-
-    def test_pdf_text_only_parse_does_not_call_ocr_or_generate_markdown(self):
-        path = self._make_pdf(two_images=False)
-        try:
-            calls = []
-
-            def fake_partition(**kwargs):
-                calls.append(kwargs)
-                return []
-
-            with (
-                patch.object(main, "partition", side_effect=fake_partition),
-                patch.object(main, "_markdown_for_pdf", side_effect=AssertionError("Markdown generation was called")),
-            ):
-                result = main._parse_document(path, "sample.pdf", ".pdf", extract_images=False)
-            self.assertEqual([call["strategy"] for call in calls], ["fast"])
-            self.assertEqual(result["text"], "")
-            self.assertNotIn("markdown", result)
-        finally:
-            Path(path).unlink(missing_ok=True)
-
-    def test_image_only_pdf_keeps_images_without_native_text_or_ocr(self):
-        path = self._make_pdf(two_images=True, include_text=False)
-        try:
-            with patch.object(main, "partition", return_value=[]):
-                result = main._parse_document(path, "images.pdf", ".pdf")
-            self.assertEqual(set(result), {"markdown"})
-            self.assertEqual(result["markdown"].count("![PDF"), 2)
-            self.assertIn("![PDF", result["markdown"])
-            self.assertNotIn("text", result)
-        finally:
-            Path(path).unlink(missing_ok=True)
-
-    def test_pdf_text_source_is_unstructured_fast_in_both_modes(self):
-        from unstructured.documents.elements import ElementMetadata, NarrativeText
-
-        path = self._make_pdf()
-        element = NarrativeText("Text from Unstructured only", metadata=ElementMetadata(page_number=1))
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                with (
-                    patch.object(main, "partition", return_value=[element]) as parser,
-                    patch.object(fitz.Page, "get_text", side_effect=AssertionError("PyMuPDF text extraction")),
-                    patch.object(main, "_extract_pdf_images", wraps=main._extract_pdf_images) as extract,
-                    patch.object(main, "_build_storage_backend", return_value=main.LocalStorageBackend(directory)),
-                ):
-                    plain = main._parse_document(path, "sample.pdf", ".pdf", extract_images=False)
-                    rich = main._parse_document(path, "sample.pdf", ".pdf", extract_images=True)
-                self.assertEqual(parser.call_count, 2)
-                self.assertEqual([call.kwargs["strategy"] for call in parser.call_args_list], ["fast", "fast"])
-                self.assertEqual(extract.call_count, 1)
-                self.assertEqual(plain, {"text": element.text})
-                self.assertEqual(set(rich), {"markdown"})
-                self.assertIn(element.text, rich["markdown"])
-                self.assertNotIn("Hello native text", rich["markdown"])
-                self.assertIn("![PDF", rich["markdown"])
-        finally:
-            Path(path).unlink(missing_ok=True)
-
-    def test_markdown_inserts_image_between_unstructured_paragraphs(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "paragraphs.pdf"
-            data = io.BytesIO()
-            Image.new("RGB", (80, 80), "blue").save(data, format="PNG")
-            with fitz.open() as document:
-                page = document.new_page(width=300, height=400)
-                page.insert_text((30, 40), "TOP paragraph before the image.")
-                page.insert_image(fitz.Rect(30, 100, 130, 180), stream=data.getvalue())
-                page.insert_text((30, 280), "BOTTOM paragraph after the image.")
-                document.save(path)
-            with patch.object(main, "_build_storage_backend", return_value=main.LocalStorageBackend(str(Path(directory) / "storage"))):
-                plain = main._parse_document(str(path), path.name, ".pdf", extract_images=False)
-                rich = main._parse_document(str(path), path.name, ".pdf", extract_images=True)
-            markdown = rich["markdown"]
-            self.assertLess(markdown.index("TOP paragraph"), markdown.index("![PDF"))
-            self.assertLess(markdown.index("![PDF"), markdown.index("BOTTOM paragraph"))
-            without_images = "\n\n".join(paragraph for paragraph in markdown.split("\n\n") if not paragraph.startswith("![PDF"))
-            self.assertEqual(without_images, plain["text"])
-
-    def test_pdf_markdown_text_failure_returns_error_and_cleans_temp_files(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "sample.pdf"
-            with fitz.open() as document:
-                document.new_page().insert_text((40, 40), "Native text")
-                document.save(path)
-            with (
-                patch.object(main, "_download_document", return_value=(str(path), path.name, ".pdf")),
-                patch.object(main.tempfile, "tempdir", directory),
-                patch.object(main, "partition", side_effect=RuntimeError("text extraction failed")),
-                TestClient(main.app) as client,
-            ):
-                response = client.post("/api/v1/parse", json={"url": "https://example.com/sample.pdf"})
-            self.assertEqual(response.status_code, 502, response.text)
-            self.assertEqual(response.json()["detail"], "document text parsing failed; the file may be damaged or missing a format dependency")
-            self.assertEqual(list(Path(directory).iterdir()), [])
-
-    def test_image_mode_keeps_markdown_when_no_images_are_returned(self):
-        path = self._make_pdf()
-        try:
-            result = main._parse_document(path, "sample.pdf", ".pdf", max_images=0)
-            self.assertEqual(result["warnings"], ["image limit reached"])
-            self.assertIn("Hello native text", result["markdown"])
-            self.assertNotIn("text", result)
-        finally:
-            Path(path).unlink(missing_ok=True)
-
-    def test_markdown_embeds_ocr_text_and_object_keys_without_metadata(self):
-        path = self._make_pdf(two_images=True)
-
-        class Adapter(main.VisionAdapter):
-            def cache_identity(self):
-                return "test-markdown-ocr"
-
-            async def recognize_image(self, image_bytes, *, mime_type, metadata=None):
-                return {"status": "success", "text": "First OCR line\nSecond OCR line"}
-
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                with (
-                    patch.object(main, "_build_storage_backend", return_value=main.LocalStorageBackend(directory)),
-                    patch.object(main, "_build_vision_adapter", return_value=Adapter()),
-                ):
-                    result = main._parse_document(path, "sample.pdf", ".pdf", recognize_images=True, filter_images=False)
-                self.assertEqual(set(result), {"markdown"})
-                self.assertIn("Hello native text", result["markdown"])
-                self.assertEqual(result["markdown"].count("![PDF"), 2)
-                self.assertEqual(result["markdown"].count("> 图片识别文本：First OCR line\n> Second OCR line"), 2)
-                links = re.findall(r"!\[[^\]]+\]\(([^)]+)\)", result["markdown"])
-                for object_key in links:
-                    self.assertTrue((Path(directory) / object_key).is_file())
-                    self.assertEqual(Path(object_key).suffix, "")
-        finally:
-            Path(path).unlink(missing_ok=True)
-
-    def test_image_upload_failure_warns_without_returning_broken_references(self):
-        path = self._make_pdf()
-
-        class Storage:
-            def put(self, *args, **kwargs):
-                raise OSError("upload failed")
-
-        try:
-            with patch.object(main, "_build_storage_backend", return_value=Storage()):
-                result = main._parse_document(path, "sample.pdf", ".pdf")
-            self.assertEqual(set(result), {"markdown", "warnings"})
-            self.assertIn("Hello native text", result["markdown"])
-            self.assertNotIn("![PDF", result["markdown"])
-            self.assertEqual(result["warnings"], ["page-1-image-1: upload failed: OSError"])
-        finally:
-            Path(path).unlink(missing_ok=True)
-
-    def test_image_limit_on_later_page_returns_warning(self):
-        path = self._make_pdf()
-        try:
-            with fitz.open(path) as document:
-                xref = document[0].get_images()[0][0]
-                page = document.new_page(width=300, height=400)
-                page.insert_image(fitz.Rect(20, 100, 120, 150), xref=xref)
-                document.saveIncr()
-            result = main._parse_document(path, "sample.pdf", ".pdf", max_images=1)
-            self.assertEqual(result["markdown"].count("![PDF"), 1)
-            self.assertEqual(result["warnings"], ["image limit reached"])
-        finally:
-            Path(path).unlink(missing_ok=True)
-
-    def test_pdf_page_limit_applies_to_text_and_markdown_images(self):
-        markers = {1: "ALPHA content", 2: "BETA content", 100: "HUNDRED content", 101: "LAST content"}
-        image = io.BytesIO()
-        Image.new("RGB", (80, 80), "red").save(image, format="PNG")
-        cases = [
-            ({}, 100, {1, 2, 100}, True),
-            ({"max_pages": 2}, 2, {1, 2}, True),
-            ({"max_pages": 2, "extract_images": False}, 2, {1, 2}, False),
-            ({"max_pages": 200}, 101, {1, 2, 100, 101}, True),
-        ]
-        for options, parsed_pages, included_pages, extract_images in cases:
-            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
-                path = str(Path(directory) / "sample.pdf")
-                with fitz.open() as document:
-                    for page_number in range(1, 102):
-                        page = document.new_page(width=300, height=400)
-                        if page_number in markers:
-                            page.insert_text((40, 40), markers[page_number])
-                            page.insert_image(fitz.Rect(20, 100, 120, 200), stream=image.getvalue())
-                    document.save(path)
-                with (
-                    patch.object(main, "_download_document", return_value=(path, "sample.pdf", ".pdf")),
-                    patch.object(main, "_build_storage_backend", return_value=main.LocalStorageBackend(str(Path(directory) / "storage"))),
-                    patch.object(main.tempfile, "tempdir", directory),
-                    TestClient(main.app) as client,
-                ):
-                    response = client.post(
-                        "/api/v1/parse",
-                        json={"url": "https://example.com/sample.pdf", **options},
-                    )
-                self.assertEqual(response.status_code, 200, response.text)
-                result = response.json()
-                content_field, absent_field = ("markdown", "text") if extract_images else ("text", "markdown")
-                self.assertIn(content_field, result)
-                self.assertNotIn(absent_field, result)
-                for page_number, marker in markers.items():
-                    if page_number in included_pages:
-                        self.assertIn(marker, result[content_field])
-                    else:
-                        self.assertNotIn(marker, result[content_field])
-                expected_fields = {content_field}
-                if parsed_pages < 101:
-                    expected_fields.add("warnings")
-                    self.assertEqual(result["warnings"], [f"PDF contains 101 pages; only the first {parsed_pages} pages were parsed"])
-                self.assertEqual(set(result), expected_fields)
-                if extract_images:
-                    image_links = re.findall(r"!\[PDF 第 (\d+) 页图片\]\(([^)]+)\)", result["markdown"])
-                    self.assertEqual({int(page) for page, _ in image_links}, included_pages)
-                    self.assertEqual(len(image_links), len(included_pages))
-                    for _, object_key in image_links:
-                        self.assertTrue((Path(directory) / "storage" / object_key).is_file())
-                        self.assertFalse(object_key.startswith(("http:", "https:")))
-                        self.assertEqual(Path(object_key).suffix, "")
-                self.assertFalse(Path(path).exists())
-                self.assertEqual(list(Path(directory).glob("unstructured-*")), [])
-
-    def test_pdf_page_limit_rejects_nonpositive_values_before_download(self):
-        with patch.object(main, "_download_document") as download, TestClient(main.app) as client:
-            for max_pages in (0, -1):
-                with self.subTest(max_pages=max_pages):
-                    response = client.post(
-                        "/api/v1/parse",
-                        json={"url": "https://example.com/sample.pdf", "max_pages": max_pages},
-                    )
-                    self.assertEqual(response.status_code, 422)
+    def test_requires_both_inputs_and_rejects_old_strategy_flags(self):
+        with patch.object(main, '_download_document') as download:
+            for payload in ({'file_url': 'https://example.com/a.pdf'}, {'file_type': 'pdf'},
+                            {'url': 'https://example.com/a.pdf'},
+                            {'file_url': 'https://example.com/a.pdf', 'file_type': 'pdf', 'max_pages': 1}):
+                self.assertEqual(self.client.post('/api/v1/parse', json=payload).status_code, 422)
             download.assert_not_called()
 
-    def test_pdf_page_preparation_failure_returns_download_error_and_cleans_temp_files(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "broken.pdf"
-            path.write_bytes(b"%PDF-broken")
-            with (
-                patch.object(main, "_download_document", return_value=(str(path), "broken.pdf", ".pdf")),
-                patch.object(main.tempfile, "tempdir", directory),
-                TestClient(main.app) as client,
-            ):
-                response = client.post("/api/v1/parse", json={"url": "https://example.com/broken.pdf"})
-            self.assertEqual(response.status_code, 502, response.text)
-            self.assertEqual(list(Path(directory).iterdir()), [])
+    def test_rejects_ssrf_targets_and_non_http(self):
+        for url in ('http://127.0.0.1/a', 'http://169.254.169.254/a', 'http://100.64.0.1/a', 'http://[::1]/a', 'file:///etc/passwd'):
+            with self.subTest(url=url), self.assertRaises(main.URLRejected):
+                main.validate_remote_url(url)
 
-    def test_vision_disabled_does_not_call_adapter(self):
-        image = {"image_id": "page-1-image-1", "image_bytes": b"x", "format": "png"}
-        adapter = type("Adapter", (), {"recognize_image": lambda *_args, **_kwargs: self.fail("called")})()
-        result = main._recognize_images([image], adapter, recognize_images=False)
-        self.assertEqual(result[0]["ocr_status"], "disabled")
+    def test_signed_path_query_and_declared_type_are_preserved(self):
+        seen = []
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.path)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/octet-stream')
+                self.end_headers()
+                self.wfile.write(b'hello signed request')
+            def log_message(self, *_): pass
+        signed = '/r%2Ffoo/%7E?Signature=a%2Fb%2Bc%3D&Expires=42&name=two+words'
+        with server_for(Handler) as base:
+            path, _, ext = main._download_document(base + signed, 'txt')
+            self.assertEqual(Path(path).read_bytes(), b'hello signed request')
+            Path(path).unlink()
+        self.assertEqual(seen, [signed])
+        self.assertEqual(ext, '.txt')
 
-    def test_configured_vision_result_is_attached_to_image(self):
-        image = {"image_id": "page-2-image-1", "image_bytes": b"x", "format": "png", "page_number": 2}
+    def test_stream_size_limit_and_cleanup(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200); self.end_headers(); self.wfile.write(b'1234567890')
+            def log_message(self, *_): pass
+        with server_for(Handler) as base, patch.object(main, 'MAX_FILE_SIZE', 4), patch.object(main.tempfile, 'tempdir', str(self.root)):
+            with self.assertRaises(main.DownloadTooLarge): main._download_document(base, 'txt')
+        self.assertFalse(list(self.root.glob('huahuo-download-*')))
 
-        class Adapter(main.VisionAdapter):
-            async def recognize_image(self, image_bytes, *, mime_type, metadata=None):
-                return {"status": "success", "text": "recognized text"}
+    def test_stream_failures_keep_gateway_error_and_cleanup(self):
+        for failure, expected in [('timeout', 504), ('truncated', 502)]:
+            release = threading.Event()
+            class Handler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(200); self.send_header('Content-Length', '100'); self.end_headers()
+                    self.wfile.write(b'%PDF-'); self.wfile.flush()
+                    if failure == 'timeout': release.wait(timeout=1)
+                    self.close_connection = True
+                def log_message(self, *_): pass
+            try:
+                with server_for(Handler) as base, patch.object(main, 'DOWNLOAD_TIMEOUT', 0.1), patch.object(main.tempfile, 'tempdir', str(self.root)):
+                    response = self.client.post('/api/v1/parse', json={'file_url': base, 'file_type': 'pdf'})
+                    self.assertEqual(response.status_code, expected, response.text)
+                    self.assertFalse(list(self.root.glob('huahuo-download-*')))
+            finally: release.set()
 
-        result = main._recognize_images([image], Adapter(), recognize_images=True)
-        self.assertEqual(result[0]["ocr_status"], "success")
-        self.assertEqual(result[0]["ocr_text"], "recognized text")
+    def test_expired_link_has_safe_error(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self): self.send_response(403); self.end_headers()
+            def log_message(self, *_): pass
+        with server_for(Handler) as base:
+            response = self.client.post('/api/v1/parse', json={'file_url': base + '/a?Signature=SECRET', 'file_type': 'pdf'})
+        self.assertEqual(response.status_code, 502)
+        self.assertIn('expired', response.json()['detail'])
+        self.assertNotIn('SECRET', response.text)
 
-    def test_vision_failure_preserves_image_and_records_error(self):
-        image = {"image_id": "page-1-image-1", "image_bytes": b"x", "format": "png", "page_number": 1}
+    def test_type_mismatch_checks_office_container_not_just_zip_signature(self):
+        from docx import Document
+        path = self.root / 'document.docx'
+        Document().save(path)
+        main._check_signature(str(path), '.docx')
+        for declared in ('.xlsx', '.pptx', '.pdf', '.png'):
+            with self.assertRaises(main.UnsupportedDocument): main._check_signature(str(path), declared)
 
-        class Adapter(main.VisionAdapter):
-            async def recognize_image(self, image_bytes, *, mime_type, metadata=None):
-                raise TimeoutError("mock timeout")
+    def test_all_101_pdf_pages_are_consumed_and_rendered_files_released(self):
+        path = self.root / '101.pdf'
+        with fitz.open() as pdf:
+            for _ in range(101): pdf.new_page(width=100, height=100)
+            pdf.save(path)
+        calls = []
+        def page(image_path, location, result):
+            self.assertTrue(Path(image_path).is_file())
+            calls.append((image_path, location['page_number']))
+            return snapshot(f"PAGE {location['page_number']}"), {}
+        with patch.object(engine, 'page', side_effect=page), patch.object(engine, 'restructure', side_effect=official_restructure):
+            result = main._parse_document(str(path), path.name, '.pdf')
+        self.assertEqual(len(calls), 101)
+        self.assertEqual(result['metadata']['parsed_page_count'], 101)
+        self.assertIn('## 第 101 页', result['markdown'])
+        self.assertTrue(all(not Path(file).exists() for file, _ in calls))
+        self.assertEqual(result['metadata']['pages'][100]['blocks'][0]['bbox'], [10, 10, 180, 180])
 
-        result = main._recognize_images([image], Adapter(), recognize_images=True)
-        self.assertEqual(result[0]["image_id"], "page-1-image-1")
-        self.assertEqual(result[0]["ocr_status"], "failed")
-        self.assertEqual(result[0]["ocr_error"], "TimeoutError")
+    def test_pdf_partial_failure_reports_exact_page(self):
+        path = self.root / 'sample.pdf'
+        with fitz.open() as pdf:
+            for _ in range(3): pdf.new_page()
+            pdf.save(path)
+        def page(_, location, result):
+            if location['page_number'] == 2: raise RuntimeError('failure')
+            return snapshot(str(location['page_number'])), {}
+        with patch.object(engine, 'page', side_effect=page), patch.object(engine, 'restructure', side_effect=official_restructure):
+            result = main._parse_document(str(path), path.name, '.pdf')
+        self.assertEqual(result['metadata']['status'], 'partial')
+        self.assertEqual(result['metadata']['issues'][0]['location']['page_number'], 2)
+        self.assertEqual(result['metadata']['parsed_page_count'], 2)
 
-    def _make_pdf(self, two_images=False, include_text=True):
-        fd, path = tempfile.mkstemp(suffix=".pdf")
-        os.close(fd)
-        image = Image.new("RGB", (20, 10), "red")
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
-        document = fitz.open()
-        page = document.new_page(width=300, height=400)
-        if include_text:
-            page.insert_text((40, 40), "Hello native text")
-        page.insert_image(fitz.Rect(20, 100, 120, 150), stream=buffer.getvalue())
-        if two_images:
-            page.insert_image(fitz.Rect(150, 200, 250, 250), stream=buffer.getvalue())
-        document.save(path)
-        document.close()
-        return path
+    def test_official_table_merge_keeps_all_sources(self):
+        table = '<table><tr><td>名称</td><td>金额</td></tr><tr><td>ITEM</td><td>1</td></tr></table>'
+        pages = [snapshot(table.replace('ITEM', 'A'), 'table', [0, 150, 200, 200]), snapshot(table.replace('ITEM', 'B'), 'table', [0, 0, 200, 40])]
+        result = self.result()
+        with patch.object(engine, 'restructure', side_effect=official_restructure):
+            text = parsing.reconstruct(pages, [{}, {}], result, [{'page_number': 1}, {'page_number': 2}])
+        self.assertEqual(result.metadata['tables'][0]['status'], 'merged')
+        self.assertEqual([source['page_number'] for source in result.metadata['tables'][0]['sources']], [1, 2])
+        from bs4 import BeautifulSoup
+        cells = [cell.get_text() for cell in BeautifulSoup(text[0], 'html.parser').find_all('td')]
+        self.assertIn('A', cells); self.assertIn('B', cells)
+        self.assertIn('第 1、2 页', text[0])
 
-    def test_endpoint_cleans_temp_file(self):
-        for extract_images in (True, False):
-            with self.subTest(extract_images=extract_images):
-                fd, path = tempfile.mkstemp(suffix=".txt")
-                os.write(fd, b"hello from a test")
-                os.close(fd)
-                try:
-                    with (
-                        TestClient(main.app) as client,
-                        patch.object(main, "_download_document", return_value=(path, "sample.txt", ".txt")),
-                    ):
-                        response = client.post(
-                            "/api/v1/parse",
-                            json={"url": "https://example.com/sample.txt", "extract_images": extract_images},
-                        )
-                    self.assertEqual(response.status_code, 200, response.text)
-                    result = response.json()
-                    content_field, absent_field = ("markdown", "text") if extract_images else ("text", "markdown")
-                    self.assertEqual(result[content_field], "hello from a test")
-                    self.assertNotIn(absent_field, result)
-                    self.assertEqual(set(result), {content_field})
-                    self.assertFalse(Path(path).exists())
-                finally:
-                    Path(path).unlink(missing_ok=True)
+    def test_ambiguous_table_merge_restores_both_segments(self):
+        first = '<table><tr><td>A</td><td>B</td></tr></table>'
+        second = '<table><tr><td>C</td><td>D</td></tr></table>'
+        result = self.result()
+        with patch.object(engine, 'restructure', side_effect=official_restructure):
+            text = parsing.reconstruct([snapshot(first, 'table'), snapshot(second, 'table')], [{}, {}], result, [{'page_number': 1}, {'page_number': 2}])
+        self.assertIn('A', text[0]); self.assertIn('C', text[1])
+        self.assertEqual(result.metadata['tables'][0]['status'], 'pending_review')
 
-    def test_native_document_formats_parse_with_the_compatible_dependency_versions(self):
+    def test_html_table_image_references_are_rewritten(self):
+        source = '<table><tr><td><img src="imgs/figure.png">recognized figure words</td></tr></table>'
+        self.assertIn('documents/test/asset', rewrite_images(source, {'imgs/figure.png': 'documents/test/asset'}))
+        self.assertNotIn('<img', rewrite_images(source, {'imgs/figure.png': None}))
+        self.assertIn('recognized figure words', rewrite_images(source, {'imgs/figure.png': None}))
+
+    def test_page_snapshot_keeps_footer_image_path_without_render_arrays(self):
+        from paddlex.inference.pipelines.paddleocr_vl.result import PaddleOCRVLBlock, PaddleOCRVLResult
+        from app.vision import VisualEngine
+        block = PaddleOCRVLBlock('footer_image', [0, 180, 200, 200], 'footer words')
+        block.image = {'path': 'imgs/footer.png', 'img': Image.new('RGB', (20, 10), 'red')}
+        data = snapshot()['res']; data['parsing_res_list'] = [block]; data['imgs_in_doc'] = []
+        raw = PaddleOCRVLResult(data)
+        class Pipeline:
+            def predict_iter(self, *args, **kwargs):
+                self.options = kwargs
+                yield raw
+        visual = VisualEngine(); visual.pipeline = Pipeline(); result = self.result()
+        page, mapping = visual.page('not-read-by-fake.png', {'page_number': 1}, result)
+        self.assertIsNone(page['res']['parsing_res_list'][0]['image']['img'])
+        self.assertEqual(visual.pipeline.options['markdown_ignore_labels'], [])
+        self.assertTrue(visual.pipeline.options['use_queues'])
+        rebuilt = official_restructure([page])[0].markdown['markdown_texts']
+        self.assertIn(mapping['imgs/footer.png'], rewrite_images(rebuilt, mapping))
+
+    def test_merged_table_images_are_resolved_before_cross_page_merge(self):
+        from paddlex.inference.pipelines.paddleocr_vl.result import PaddleOCRVLBlock, PaddleOCRVLResult
+        from app.vision import VisualEngine
+        result = self.result()
+        snapshots, maps = [], []
+        for page_number, color, box in [(1, 'red', [0, 150, 200, 200]), (2, 'blue', [0, 0, 200, 40])]:
+            block = PaddleOCRVLBlock('table', box, '<table><tr><td>Header</td></tr><tr><td><img src="imgs/same-name.png"></td></tr></table>')
+            data = snapshot()['res']; data['parsing_res_list'] = [block]
+            data['imgs_in_doc'] = [{'path': 'imgs/same-name.png', 'img': Image.new('RGB', (20, 20), color)}]
+            raw = PaddleOCRVLResult(data)
+            class Pipeline:
+                def predict_iter(self, *args, **kwargs): yield raw
+            visual = VisualEngine(); visual.pipeline = Pipeline()
+            page, mapping = visual.page('fake.png', {'page_number': page_number}, result)
+            snapshots.append(page); maps.append(mapping)
+        with patch.object(engine, 'restructure', side_effect=official_restructure):
+            text = '\n'.join(parsing.reconstruct(snapshots, maps, result, [{'page_number': 1}, {'page_number': 2}]))
+        self.assertNotEqual(maps[0]['imgs/same-name.png'], maps[1]['imgs/same-name.png'])
+        self.assertIn(maps[0]['imgs/same-name.png'], text)
+        self.assertIn(maps[1]['imgs/same-name.png'], text)
+        self.assertNotIn('imgs/same-name.png', text)
+        self.assertEqual(result.metadata['tables'][0]['status'], 'pending_review')
+
+    def test_pdf_only_publishes_chart_and_captioned_figure_with_one_reference(self):
+        from paddlex.inference.pipelines.paddleocr_vl.result import PaddleOCRVLBlock, PaddleOCRVLResult
+
+        def image_block(label, bbox, text, name, color):
+            block = PaddleOCRVLBlock(label, bbox, text)
+            block.image = {'path': f'imgs/{name}.png', 'img': Image.new('RGB', (20, 20), color)}
+            return block
+
+        def page_result(blocks, extras=()):
+            data = snapshot()['res']
+            pixels = np.zeros((200, 200, 3), dtype=np.uint8)
+            pixels[..., 2] = 255
+            data.update(parsing_res_list=blocks, imgs_in_doc=list(extras))
+            data['doc_preprocessor_res'] = {'output_img': pixels}
+            return PaddleOCRVLResult(data)
+
+        path = self.root / 'assets.pdf'
+        with fitz.open() as pdf:
+            for _ in range(2):
+                pdf.new_page(width=100, height=100)
+            pdf.save(path)
+
+        figure_box = [20, 45, 80, 105]
+        chart_box = [110, 40, 190, 100]
+        caption = PaddleOCRVLBlock('figure_title', [20, 106, 80, 115], '图 1 接线示意图')
+        cells = [{'path': f'imgs/cell-{i}.png', 'img': Image.new('RGB', (2, 2), 'black')} for i in range(1000)]
+        table_top = PaddleOCRVLBlock('table', [0, 150, 200, 200],
+            '<table><tr><td>Item</td></tr><tr><td>第一行 <img src="imgs/cell-999.png"></td></tr></table>')
+        table_bottom = PaddleOCRVLBlock('table', [0, 0, 200, 35],
+            '<table><tr><td>Item</td></tr><tr><td>第二行 <img src="imgs/cell-999.png"></td></tr></table>')
+        first = page_result([
+            image_block('header_image', [0, 0, 50, 12], '页眉 OCR', 'logo', 'red'),
+            image_block('image', [5, 15, 95, 36], '截图 OCR', 'screenshot', 'blue'),
+            image_block('image', figure_box, '接线标签 OCR', 'figure', 'green'),
+            caption,
+            image_block('seal', [110, 110, 152, 138], '印章 OCR', 'seal', 'yellow'),
+            PaddleOCRVLBlock('chart', chart_box),
+            table_top,
+        ], cells)
+        second = page_result([
+            table_bottom,
+            image_block('image', figure_box, '重复图仍保留 OCR', 'figure', 'green'),
+            caption,
+            image_block('chart', chart_box, '', 'repeated-chart', 'red'),
+        ], cells[-1:])
+        second['parsing_res_list'][-1].image['img'] = Image.new('RGB', (80, 60), 'red')
+        pipeline = Mock()
+        pipeline.predict_iter.side_effect = [iter([first]), iter([second])]
+        pipeline.restructure_pages.side_effect = lambda pages, **_: official_restructure(pages)
+        with patch.object(engine, 'pipeline', pipeline), patch.dict(os.environ, {'PDF_RENDER_DPI': '144'}), \
+                patch.object(vision, '_save_image', wraps=vision._save_image) as save:
+            parsed = parsing.parse_document(str(path), path.name, '.pdf', self.result().storage, 'test')
+
+        markdown, metadata = parsed['markdown'], parsed['metadata']
+        self.assertEqual(save.call_count, 4)  # Two figures and two charts; no incidental crops encoded.
+        self.assertEqual(len(metadata['assets']), 2)
+        for asset in metadata['assets']:
+            self.assertEqual(markdown.count(asset['uri']), 1)
+            self.assertTrue(self.result().storage.resolve(asset['object_key']).is_file())
+        self.assertEqual(metadata['assets'][0]['location']['bbox'], figure_box)
+        self.assertEqual([source['page_number'] for source in metadata['assets'][0]['locations']], [1, 2])
+        self.assertEqual(metadata['assets'][1]['location']['bbox'], chart_box)
+        self.assertEqual([source['page_number'] for source in metadata['assets'][1]['locations']], [1, 2])
+        with Image.open(self.result().storage.resolve(metadata['assets'][1]['object_key'])) as chart:
+            self.assertEqual(chart.size, (80, 60))
+            self.assertEqual(chart.getpixel((0, 0)), (255, 0, 0))
+        self.assertIn('![原始图表]', markdown)
+        for text in ('页眉 OCR', '截图 OCR', '接线标签 OCR', '印章 OCR', '重复图仍保留 OCR', '第一行', '第二行'):
+            self.assertIn(text, markdown)
+        self.assertNotIn('imgs/', markdown)
+        self.assertNotIn('imgs/', repr(metadata['pages']))
+        self.assertEqual(metadata['tables'][0]['status'], 'merged')
+        self.assertEqual([source['page_number'] for source in metadata['tables'][0]['sources']], [1, 2])
+        self.assertEqual(metadata['status'], 'complete')
+
+    def test_cuda_initialization_fails_clearly_with_cpu_paddle(self):
+        try:
+            import paddle
+        except (ImportError, NameError) as exc:
+            cause = exc
+            while cause is not None:
+                if 'libcuda.so.1' in str(cause):
+                    self.skipTest('Paddle GPU import requires the host NVIDIA driver; unavailable on the Mac build VM')
+                cause = cause.__cause__ or cause.__context__
+            raise
+        from app.errors import ModelUnavailable
+        from app.vision import VisualEngine
+        with patch.dict(os.environ, {'PADDLEOCR_BACKEND': 'cuda'}), patch.object(paddle, 'is_compiled_with_cuda', return_value=False):
+            with self.assertRaisesRegex(ModelUnavailable, 'requires paddlepaddle-gpu'):
+                VisualEngine().initialize()
+
+    def test_missing_nvidia_driver_has_actionable_startup_error(self):
+        import builtins
+        from app.errors import ModelUnavailable
+        original_import = builtins.__import__
+
+        def import_without_driver(name, *args, **kwargs):
+            if name == 'paddle':
+                raise NameError('Paddle secondary import failure') from ImportError('libcuda.so.1: cannot open shared object file')
+            return original_import(name, *args, **kwargs)
+
+        with patch.dict(os.environ, {'PADDLEOCR_BACKEND': 'cuda'}), patch('builtins.__import__', side_effect=import_without_driver):
+            with self.assertRaisesRegex(ModelUnavailable, 'libcuda.so.1.*NVIDIA driver.*--gpus all'):
+                vision.VisualEngine().initialize()
+
+    def test_captionless_ppt_pdf_visuals_and_pasted_slides_are_kept(self):
+        from paddlex.inference.pipelines.paddleocr_vl.result import PaddleOCRVLBlock, PaddleOCRVLResult
+        from app.vision import VisualEngine
+        cases = [
+            (1600, 900, [80, 160, 850, 820]),   # Captionless diagram on a wide slide.
+            (1200, 1700, [80, 500, 1120, 1150]),  # Slide screenshot pasted in a portrait PDF.
+        ]
+        for width, height, box in cases:
+            with self.subTest(size=(width, height)):
+                visual = PaddleOCRVLBlock('image', box, '无图题示意图中的文字')
+                visual.image = {'path': 'imgs/visual.png', 'img': Image.new('RGB', (100, 100), 'blue')}
+                logo = PaddleOCRVLBlock('image', [10, 10, 80, 50], '小型标志文字')
+                logo.image = {'path': 'imgs/logo.png', 'img': Image.new('RGB', (40, 20), 'red')}
+                data = snapshot(width=width, height=height)['res']
+                data.update(parsing_res_list=[logo, visual], imgs_in_doc=[])
+                raw = PaddleOCRVLResult(data)
+                pipeline = Mock(); pipeline.predict_iter.return_value = iter([raw])
+                engine = VisualEngine(); engine.pipeline = pipeline
+                result = self.result(); result.metadata['file_type'] = 'pdf'
+                page, mapping = engine.page('fake.png', {'page_number': 1}, result)
+                markdown = rewrite_images(official_restructure([page])[0].markdown['markdown_texts'], mapping)
+                self.assertEqual(len(result.metadata['assets']), 1)
+                self.assertEqual(result.metadata['assets'][0]['location']['bbox'], box)
+                self.assertIn(result.metadata['assets'][0]['uri'], markdown)
+                self.assertIn('无图题示意图中的文字', markdown)
+                self.assertIn('小型标志文字', markdown)
+
+    def test_artifact_commit_failure_never_reports_success(self):
+        class Storage:
+            def put(self, *args, **kwargs): raise OSError('failed')
+        result = DocumentResult('test', Storage())
+        with self.assertRaises(main.DownloadError): result.finish()
+
+    def test_local_artifact_download_and_path_confinement(self):
+        result = self.result(); result.parts.append('你好'); output = result.finish()
+        key = output['metadata']['markdown_object_key']
+        response = self.client.get('/artifacts/' + key)
+        self.assertEqual(response.status_code, 200); self.assertEqual(response.text, '你好\n')
+        with self.assertRaises(ValueError): LocalStorageBackend(str(self.root)).resolve('../secret')
+
+    def test_api_temp_cleanup_on_success_and_failure(self):
+        for failed in (False, True):
+            path = self.root / 'sample.txt'; path.write_text('hello')
+            with patch.object(main, '_download_document', return_value=(str(path), path.name, '.txt')):
+                if failed:
+                    with patch.object(main, '_parse_document', side_effect=main.DownloadError('failed')):
+                        response = self.client.post('/api/v1/parse', json={'file_url': 'https://example.com/a', 'file_type': 'txt'})
+                else: response = self.client.post('/api/v1/parse', json={'file_url': 'https://example.com/a', 'file_type': 'txt'})
+            self.assertEqual(response.status_code, 502 if failed else 200)
+            self.assertFalse(path.exists())
+
+    def test_existing_native_format_samples(self):
         from docx import Document
         from openpyxl import Workbook
         from pptx import Presentation
+        marker = 'Compatibility format verification'
+        document = Document(); document.add_paragraph(marker); document.save(self.root / 'sample.docx')
+        presentation = Presentation(); slide = presentation.slides.add_slide(presentation.slide_layouts[1]); slide.shapes.title.text = marker; presentation.save(self.root / 'sample.pptx')
+        workbook = Workbook(); workbook.active.append(['title']); workbook.active.append([marker]); workbook.save(self.root / 'sample.xlsx')
+        for extension, content in [('txt', marker), ('md', '# ' + marker), ('html', '<p>' + marker + '</p>'), ('csv', 'id,title\n1,' + marker)]:
+            (self.root / ('sample.' + extension)).write_text(content)
+        for path in self.root.glob('sample.*'):
+            result = main._parse_document(str(path), path.name, path.suffix)
+            self.assertIn(marker, result['markdown']); self.assertEqual(result['metadata']['status'], 'complete')
 
-        marker = "Compatibility format verification"
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            document = Document()
-            document.add_paragraph(marker)
-            document.save(root / "sample.docx")
-            presentation = Presentation()
-            slide = presentation.slides.add_slide(presentation.slide_layouts[1])
-            slide.shapes.title.text = marker
-            presentation.save(root / "sample.pptx")
-            workbook = Workbook()
-            workbook.active.append(["title"])
-            workbook.active.append([marker])
-            workbook.save(root / "sample.xlsx")
-            for extension, content in (
-                ("txt", marker),
-                ("csv", "id,title\n1," + marker),
-                ("md", "# " + marker),
-                ("html", "<html><body><p>" + marker + "</p></body></html>"),
-            ):
-                (root / ("sample." + extension)).write_text(content)
-            for path in sorted(root.iterdir()):
-                with self.subTest(format=path.suffix):
-                    result = main._parse_document(str(path), path.name, path.suffix, extract_images=False)
-                    self.assertEqual(set(result), {"text"})
-                    self.assertIn(marker, result["text"])
+    def test_xlsx_native_formulas_cached_values_and_merges(self):
+        import xlsxwriter
+        path = self.root / 'formulas.xlsx'
+        workbook = xlsxwriter.Workbook(path); sheet = workbook.add_worksheet('预算')
+        sheet.merge_range('A1:B1', '预算表'); sheet.write('A2', 10); sheet.write_formula('B2', '=A2*2', None, 20); workbook.close()
+        result = main._parse_document(str(path), path.name, '.xlsx')
+        data = result['metadata']['sheets'][0]
+        self.assertEqual(data['merged_ranges'], ['A1:B1'])
+        formula = next(cell for cell in data['cells'] if cell['cell'] == 'B2')
+        self.assertEqual(formula['formula'], '=A2*2'); self.assertEqual(formula['cached_value'], 20)
+        self.assertIn('A1:B2', result['markdown']); self.assertIn('colspan="2"', result['markdown'])
+
+    def test_xlsx_missing_formula_cache_is_explicit(self):
+        from openpyxl import Workbook
+        path = self.root / 'cache.xlsx'; workbook = Workbook(); workbook.active['A1'] = '=1+1'; workbook.save(path)
+        result = main._parse_document(str(path), path.name, '.xlsx')
+        self.assertIn('计算结果缺失', result['markdown']); self.assertEqual(result['metadata']['status'], 'partial')
+        self.assertEqual(result['metadata']['issues'][0]['location']['cell'], 'A1')
+
+    def test_docx_embedded_picture_uses_visual_path_at_paragraph(self):
+        from docx import Document
+        document = Document(); document.add_heading('章节', 1); document.add_paragraph('条目', style='List Bullet')
+        image = io.BytesIO(); Image.new('RGB', (100, 100), 'white').save(image, format='PNG'); image.seek(0)
+        document.add_paragraph().add_run().add_picture(image); path = self.root / 'images.docx'; document.save(path)
+        result = self.result()
+        with patch('app.parsing.recognize_office_image', return_value='视觉来源文本') as visual:
+            parsing.parse_document(str(path), path.name, '.docx', result.storage, 'test')
+            self.assertEqual(visual.call_count, 1); self.assertEqual(visual.call_args.args[1]['paragraph'], 3)
+
+    def test_legacy_xls_keeps_original_cached_value_and_reads_formula_and_image(self):
+        import struct
+        import olefile
+        import xlsxwriter
+        from app.office import libreoffice
+        source = self.root / 'legacy-source.xlsx'
+        image = io.BytesIO(); Image.new('RGB', (100, 60), 'red').save(image, format='PNG'); image.seek(0)
+        workbook = xlsxwriter.Workbook(source); sheet = workbook.add_worksheet('Legacy')
+        sheet.write('A1', 10); sheet.write_formula('B1', '=A1*2', None, 20)
+        sheet.insert_image('A4', 'image.png', {'image_data': image}); workbook.close()
+        path = libreoffice(source, self.root, 'xls')
+        with olefile.OleFileIO(path, write_mode=True) as compound:
+            data = bytearray(compound.openstream('Workbook').read()); offset = 0; changed = False
+            while offset + 4 <= len(data):
+                code, size = struct.unpack_from('<HH', data, offset)
+                if code == 0x0006 and size >= 22:
+                    row, column = struct.unpack_from('<HH', data, offset + 4)
+                    if (row, column) == (0, 1):
+                        data[offset + 10:offset + 18] = struct.pack('<d', 1234.5); changed = True
+                offset += 4 + size
+            self.assertTrue(changed)
+            compound.write_stream('Workbook', bytes(data))
+        main._check_signature(str(path), '.xls')
+        with patch('app.parsing.recognize_office_image', return_value='legacy screenshot') as visual:
+            result = main._parse_document(str(path), path.name, '.xls')
+        formula = next(cell for cell in result['metadata']['sheets'][0]['cells'] if cell['cell'] == 'B1')
+        self.assertEqual(formula['cached_value'], 1234.5)
+        self.assertIn('A1*2', formula['formula'])
+        self.assertEqual(visual.call_count, 1)
+        self.assertEqual(result['metadata']['status'], 'complete')
+
+    def test_pptx_chart_notes_and_slide_order(self):
+        from pptx import Presentation
+        from pptx.chart.data import ChartData
+        from pptx.enum.chart import XL_CHART_TYPE
+        from pptx.util import Inches
+        path = self.root / 'chart.pptx'; presentation = Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6]); data = ChartData(); data.categories = ['A', 'B']; data.add_series('金额', [1, 2])
+        slide.shapes.add_chart(XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(1), Inches(1), Inches(5), Inches(3), data)
+        slide.notes_slide.notes_text_frame.text = 'Speaker note'; presentation.slides.add_slide(presentation.slide_layouts[6]); presentation.save(path)
+        result = main._parse_document(str(path), path.name, '.pptx')
+        self.assertIn('Speaker note', result['markdown']); self.assertLess(result['markdown'].index('幻灯片 1'), result['markdown'].index('幻灯片 2'))
+        self.assertEqual(result['metadata']['slides'][0]['shapes'][0]['chart']['series'][0]['values'], [1.0, 2.0])
+
+    def test_docx_numbering_vertical_merges_and_readable_math(self):
+        from docx import Document
+        from docx.oxml import OxmlElement
+        document = Document()
+        document.add_paragraph('First', style='List Number'); document.add_paragraph('Second', style='List Number')
+        table = document.add_table(rows=2, cols=2); table.cell(0, 0).text = 'Merged'; table.cell(0, 0).merge(table.cell(1, 0))
+        paragraph = document.add_paragraph('Equation: ')
+        math = OxmlElement('m:oMath'); fraction = OxmlElement('m:f')
+        for tag, text in [('m:num', 'x'), ('m:den', 'y')]:
+            parent = OxmlElement(tag); run = OxmlElement('m:r'); value = OxmlElement('m:t'); value.text = text
+            run.append(value); parent.append(run); fraction.append(parent)
+        math.append(fraction); paragraph._p.append(math)
+        path = self.root / 'word.docx'; document.save(path)
+        result = main._parse_document(str(path), path.name, '.docx')
+        self.assertIn('1. First', result['markdown']); self.assertIn('2. Second', result['markdown'])
+        self.assertIn('rowspan="2"', result['markdown']); self.assertIn(r'\frac{x}{y}', result['markdown'])
+
+    def test_grouped_pptx_uses_real_libreoffice_slide_render(self):
+        from pptx import Presentation
+        from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
+        from pptx.util import Inches
+        presentation = Presentation(); slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        group = slide.shapes.add_group_shape()
+        group.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(1), Inches(1), Inches(2), Inches(1)).text = 'Group context'
+        slide._element.set('show', '0')
+        presentation.slides.add_slide(presentation.slide_layouts[6])
+        path = self.root / 'groups.pptx'; presentation.save(path)
+        with patch('app.parsing.recognize_office_image', return_value='视觉来源文本') as visual:
+            result = main._parse_document(str(path), path.name, '.pptx')
+        self.assertEqual(visual.call_args.args[1], {'slide_number': 1, 'scope': 'whole_slide'})
+        self.assertTrue(visual.call_args.args[0].startswith(b'\x89PNG'))
+        with Image.open(io.BytesIO(visual.call_args.args[0])) as rendered:
+            self.assertTrue(any(low < 240 for low, high in rendered.convert('RGB').getextrema()))
+        self.assertIn('幻灯片 1 整页视觉上下文', result['markdown'])
+        self.assertTrue(result['metadata']['slides'][0]['hidden'])
+        self.assertEqual(result['metadata']['status'], 'complete')
 
 
-if __name__ == "__main__":
-    unittest.main()
+if __name__ == '__main__': unittest.main()

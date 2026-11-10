@@ -1,0 +1,7 @@
+mlx-vlm==0.3.11
+mlx==0.30.6
+mlx-lm==0.30.5
+transformers==5.0.0rc3
+huggingface-hub==1.4.1
+fastapi==0.115.14
+uvicorn==0.35.0

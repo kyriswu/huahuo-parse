@@ -1,13 +1,10 @@
 name: huahuo-parse
-
 services:
   api:
-    image: huahuo-parse:0.1.0
+    image: ${DOCKERHUB_REPO:-magiclaw/huahuo-parse}:${VERSION_TAG:-local}
+    platform: linux/amd64
     build:
       context: .
-      args:
-        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-https://deb.debian.org}
-        PYPI_INDEX_URL: ${PYPI_INDEX_URL:-https://pypi.org/simple}
     init: true
     restart: unless-stopped
     env_file:
@@ -16,17 +13,22 @@ services:
         required: false
     environment:
       PORT: "4763"
+      PADDLEOCR_BACKEND: cuda
+      MODEL_ROOT: /opt/models
       STORAGE_LOCAL_ROOT: /app/var/storage
+    gpus: all
+    shm_size: 2gb
+    cpus: 4
+    mem_limit: 14g
     ports:
       - "${PORT:-4763}:4763"
     volumes:
       - storage:/app/var/storage
-    stop_grace_period: 30s
+    stop_grace_period: 60s
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-
 volumes:
   storage:

@@ -1,0 +1,2 @@
+-r requirements.txt
+paddlepaddle==3.2.2

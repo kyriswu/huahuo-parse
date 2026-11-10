@@ -1,0 +1,17 @@
+fastapi==0.115.14
+uvicorn==0.35.0
+paddleocr[doc-parser,doc2md]==3.7.0
+paddlex==3.7.2
+python-docx==1.2.0
+python-pptx==1.0.2
+openpyxl==3.1.5
+xlrd==2.0.1
+PyMuPDF==1.26.7
+oss2==2.19.1
+olefile==0.47
+numpy==1.26.4
+requests==2.34.2
+httpx==0.28.1
+huggingface-hub==1.4.1
+scipy==1.17.1
+scikit-learn==1.9.1

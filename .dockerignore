@@ -1,8 +1,11 @@
 *
 !Dockerfile
-!requirements.txt
-!requirements.lock.txt
+!requirements-linux.lock.txt
+!scripts/
+!scripts/prepare_models.py
+!licenses/
+!licenses/Apache-2.0.txt
 !app/
-!app/**
+!app/*.py
 **/__pycache__/
 **/*.py[cod]

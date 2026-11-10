@@ -1,6 +1,9 @@
-.venv/
+.venv*/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .env
 var/
+.env.*
+!.env.example
+build/

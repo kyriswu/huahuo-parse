@@ -1,127 +1,161 @@
-# Unstructured URL 文档解析 API
+# huahuo-parse 文档解析服务
 
-独立的 Python 3.12 + FastAPI + Uvicorn + Unstructured 服务。当前锁定 `unstructured==0.14.8` 和 `PyMuPDF==1.26.7`。PDF 的文字始终使用 Unstructured `fast` 提取；开启提图时额外使用 PyMuPDF 提取嵌入图片及其位置，再合成为图文 Markdown；本服务不启用 `hi_res`、`ocr_only` 或本地 OCR。`POST /api/v1/parse` 接收 JSON 文档 URL，服务端对每次请求做 DNS/SSRF 校验、限时流式下载到随机临时文件，解析后删除临时文件。
+同步 FastAPI 服务，通过 `POST /api/v1/parse` 下载原件并输出带来源定位的 UTF-8 Markdown。所有请求执行完整流程，不截断 PDF 页数，不接收上游识别预算、文件分类或抽取策略。PDF 和图片统一使用 PaddleOCR-VL-1.6；Office 读取原生字段，并将内嵌图片交给同一个视觉实例。
 
-## 项目管理与边界
-
-本项目使用 Docker Compose 启动，基础镜像固定为 `python:3.12.12-slim-bookworm`（同时锁定 SHA-256 摘要），通过 `pip` 按 `requirements.txt` 安装运行依赖，版本由 `requirements.lock.txt` 锁定，不依赖宿主机 Python 或 `uv`。`requirements.txt` 列出直接依赖，并使用锁文件约束版本；更新依赖时须同步更新锁文件、重新构建和验证镜像。服务是无状态的 URL 文档解析前置服务：不使用数据库，也不负责 RAG 切片、向量化或入库。若未来确实需要跨请求的轻量状态，优先考虑 Redis；当前识别缓存仅为有上限的进程内缓存，多进程之间不共享。
-
-图片会在本服务内完成提取、OSS 保存、确定性过滤、SHA-256 精确去重和可选识别调度。图片说明和原生文本在 `markdown` 中先合并，后续 RAG 服务再进行切片和入库。
-
-## Docker 启动
-
-宿主机需要 Docker Engine 和 Docker Compose 插件（Compose 2.24.0 或更新版本）。
+## API 与结果
 
 ```bash
-cd /root/huahuo-parse
-# 可选：需要自定义配置或 OSS、视觉 API 密钥时复制后编辑
-test -f .env || cp .env.example .env
-chmod 600 .env
-# 首次构建镜像并在后台启动，等待健康检查通过
-./run.sh
-```
-
-日常管理：
-
-```bash
-docker compose ps
-docker compose logs -f --tail=100 api
-./stop.sh
-./restart.sh
-```
-
-`./run.sh` 等价于 `docker compose up -d --build --wait --wait-timeout 120`，代码或依赖改变后再次执行即可构建并更新容器。容器异常退出或 Docker 重启后会自动启动；手动停止后保持停止状态。日志输出到 Docker，自动轮转（每份 10 MB，保留 3 份）。
-
-首次构建需要下载系统和 Python 依赖。若官方源下载较慢，可在 `.env` 中添加 `DEBIAN_MIRROR=https://mirrors.aliyun.com` 和 `PYPI_INDEX_URL=https://mirrors.aliyun.com/pypi/simple` 后重新执行 `./run.sh`；这些选项只影响构建时的下载源，依赖版本仍由锁文件确定。
-
-构建使用 BuildKit 缓存 Python 包下载，缓存不会进入最终镜像。NLTK 文本分词数据从上游固定提交的 CDN 地址下载并校验 SHA-256，随镜像预置。
-
-Compose 默认加载 `.env.example`，再由可选的 `.env` 覆盖配置；`.env` 不会复制到镜像。程序读取 `MAX_FILE_SIZE_MB`、`DOWNLOAD_TIMEOUT_SECONDS`、`MAX_REDIRECTS`、`LOG_LEVEL`、`MAX_PDF_IMAGES`、`MAX_PDF_TOTAL_IMAGE_MB`、`STORAGE_*`、图片过滤阈值、识别预算和视觉适配器配置。PDF 页数范围由请求参数 `max_pages` 统一控制。`.env` 中的 `PORT` 控制宿主机端口（默认 `4763`），容器内固定监听 `4763`；修改配置后执行 `./run.sh` 使其生效。
-
-本地图片存储固定挂载到容器 `/app/var/storage`，使用 Docker 命名卷 `huahuo-parse_storage`，停止、重启或重建容器均保留文件；使用 OSS 时仍按 `STORAGE_ALIYUN_OSS_*` 配置上传。镜像预装 libmagic 和 NLTK 分词数据，无需在首次解析时下载；不安装 LibreOffice 或本地 OCR。
-
-`unstructured==0.14.8` 原生支持 Python 3.12。PDF 无论是否提图，文字均只调用一次 Unstructured `fast`，不会改用 PyMuPDF 提取文字。开启提图时仅在内部使用 Unstructured 元素的页码和坐标插入图片，这些元数据不返回给调用方。不安装 `unstructured-inference`、Torch、CUDA 或视觉模型。OpenCV、pdf2image 等包是 Unstructured 0.14.8 的 PDF 模块导入依赖，保留这些包不会启用视觉识别。
-
-当前验证兼容组合为 `unstructured==0.14.8` 和 `pdfminer-six==20240706`。从 Unstructured 0.14.9 起引入的 PDF 布局分析导入链需要推理组件；pdfminer.six 2025 年及之后版本移除了旧版 Unstructured 使用的 `pdfminer.pdfparser.PSSyntaxError` 导出。升级时必须执行真实 PDF fast 解析和 `pip check`，不能只验证安装成功或健康检查。
-
-在容器环境运行现有测试：
-
-```bash
-docker compose run --rm --no-deps -e STORAGE_LOCAL_ROOT=/tmp/test-storage -v "$PWD/tests:/app/tests:ro" api python -m unittest discover -s tests -v
-```
-
-## API
-
-健康检查：
-
-```bash
-curl http://127.0.0.1:4763/health
-```
-
-解析远程文档：
-
-```bash
-curl -sS -X POST http://127.0.0.1:4763/api/v1/parse \
+curl -sS http://127.0.0.1:4763/health
+curl -sS http://127.0.0.1:4763/api/v1/parse \
   -H 'Content-Type: application/json' \
-  -d '{"url":"https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf","max_pages":100,"extract_images":true}'
+  -d '{"file_url":"https://example.com/document.pdf","file_type":"pdf"}'
 ```
 
-请求参数：
-
-| 参数 | 默认值 | 用途 |
-| --- | --- | --- |
-| `url` | 必填 | HTTP/HTTPS 文档地址。 |
-| `extract_images` | `true` | 开启 PDF 图片提取并返回 `markdown`；关闭时返回 `text`。其他支持格式也按此选项选择正文字段，当前图片提取仅支持 PDF。 |
-| `max_pages` | `100` | 仅 PDF 使用，统一处理前 N 页的文本和图片，必须为正整数。超出部分跳过，不因总页数超限报错；设置值超过总页数时处理全部页面。 |
-| `recognize_images` | `false` | 是否使用已配置的外部视觉服务识别图片，并将结果合并进 Markdown。 |
-| `max_images` | `100` | 本次提取的图片实例数量上限，范围 0–1000，仍受服务端 `MAX_PDF_IMAGES` 约束。 |
-| `max_image_bytes` | `10485760` | 单张图片字节上限，默认 10 MiB，最大 100 MiB；不控制原始文档大小。 |
-| `filter_images` | `true` | 是否对图片进行尺寸、重复资源和页眉页脚过滤，以控制识别调度；不删除 Markdown 中的已提取图片。 |
-| `max_recognition_images` | `20` | 本次外部识别调用预算，默认可由 `MAX_RECOGNITION_IMAGES` 配置，范围 0–1000。 |
-
-成功响应只包含后续流程需要的正文。开启图片提取时：
+只有 `file_url`、`file_type` 两个必填输入。`file_type` 为扩展名（大小写不敏感，可带点）。签名 URL 作为不透明字符串传输，不解码路径、不重排查询参数；下载使用原始请求目标，经过 DNS、重定向、实际连接地址、TLS 证书及文件内容检查。解析器按声明类型选择，OOXML 检查 ZIP 内部类型，旧 Office 检查 OLE 流，图片检查真实编码。超限返回 413，类型不符返回 415，过期/下载失败返回 502，下载超时返回 504，模型不可用返回 503，错误仍采用 `{"detail":"..."}`。
 
 ```json
 {
-  "markdown": "第一段正文。\n\n![PDF 第 1 页图片](pdf-images/对象ID/page-1-image-1)\n\n下一段正文。"
+  "markdown": "## 第 1 页\n\n章节与表格……\n",
+  "metadata": {
+    "document_id": "每次请求沿用 UUID 文档命名空间",
+    "file_type": "pdf",
+    "encoding": "UTF-8",
+    "status": "complete",
+    "page_count": 1,
+    "parsed_page_count": 1,
+    "pages": [{"page_number": 1, "render_width": 1191, "render_height": 1684,
+      "coordinate_system": "rendered_image_pixels",
+      "blocks": [{"block_id": 0, "label": "text", "bbox": [30, 40, 500, 120], "content": "正文"}]}],
+    "tables": [],
+    "assets": [],
+    "issues": [],
+    "markdown_object_key": "documents/UUID/markdown"
+  }
 }
 ```
 
-图片引用保留原始存储对象键，不拼接域名、访问地址或扩展名，由后续流程处理。启用并成功完成 OCR 时，识别文本作为引用块紧随对应图片，例如 `> 图片识别文本：识别出的内容`。多行识别结果保留在同一个引用块中。
+正文包含原页序号、Word 节、Sheet 范围或幻灯片编号；PDF 元数据还保留 PDF 自带页标签。跨页表格的 `sources` 列出全部原页、坐标与渲染尺寸。所有页面先消费为无图像数组的 JSON，再调用官方 `restructure_pages(merge_tables=True, relevel_titles=True)`。上游可能按相同列数合并无关表格，因此额外要求明确的页边接续及相同表头；有歧义时恢复各页原表，标记 `pending_review`。识别的脚注、页眉、页脚通过 `markdown_ignore_labels=[]` 保留。
 
-设置 `extract_images=false` 时只返回：
+部分失败返回 `metadata.status=partial`，`issues` 包含原因和位置，并附 `warnings`。完全无法读取或所有页失败返回错误。所有引用产物先保存，最后原子提交 UTF-8 Markdown，之后才返回结果。仓库没有异步任务、重试或幂等提交系统；继续使用同步响应和每份文档 UUID，不额外引入数据库或任务队列。
 
-```json
-{
-  "text": "第一段正文。\n\n下一段正文。"
-}
+图片沿用本地/OSS 的无扩展名对象键。`metadata.assets` 包含 MIME、SHA-256、来源和对象键。本地可通过 `download_path`（`/artifacts/documents/...`）读取，已有下游继续按对象键解析。配置 `STORAGE_PUBLIC_BASE_URL` 可输出完整图片地址。
+
+PDF 保存版面识别出的图表、同栏邻近且带明确图注的正文图，以及无图题的主要视觉内容：横版幻灯片中的大图、占据页面较大面积的图和嵌入竖版 PDF 的宽幅截图。因此 PPT 转 PDF 不依赖“图题”才能保留配图。图表即使没有识别出数据，也会按坐标从当前页裁出原图。页眉页脚图、印章图、小型装饰图和表格内部裁剪碎片在编码、上传前跳过，已识别的文字、表格和来源坐标继续输出。同一 PDF 内完全相同的图片只保存并引用一次，重复位置记录在该图片的 `locations` 中。下游可用 Markdown 做文字索引，以 `metadata.assets` 为图片引用清单。
+
+## 格式范围
+
+| 格式 | 路径及保留内容 |
+| --- | --- |
+| PDF | 全部页面逐页渲染、版面分析、VLM；包含文字层 PDF、扫描件、PPT 截图 PDF。 |
+| PNG/JPEG/TIFF/BMP | 校验真实图片编码；TIFF 全部帧；与 PDF 共用模型。 |
+| DOCX | 原生标题、段落、列表、表格、可读取 OMML 公式、页眉页脚；内嵌图片视觉结果单独标注。 |
+| XLSX | Sheet、范围、合并关系、原生数值/类型/数字格式、公式和文件保存的计算值；缺缓存保留公式并标明缺失。服务不重算公式。 |
+| PPTX | 幻灯片顺序、原生文字、表格、图表系列/分类、备注、图片；组合图形使用 LibreOffice 整页渲染补充上下文。 |
+| DOC/PPT | 沿用既有 LibreOffice 转换读取路线，再进入 DOCX/PPTX 同一流程。 |
+| XLS | 沿用 xlrd 读取原始保存值/公式缓存和合并关系，使用 LibreOffice 辅助恢复公式表达式和图片；忽略转换器重新计算的结果。辅助恢复失败时保留原始值并标记部分成功。 |
+| TXT/MD/CSV/HTML | UTF-8 原生读取；CSV 输出 HTML 表格，HTML 提取可见文字，不下载外部资源。 |
+
+Office 的原生字段为准，视觉识别以“视觉识别”独立标注，并带对应段落、单元格或幻灯片定位。隐藏幻灯片保留原顺序，并进入组合图形渲染。格式损坏、无法识别的内嵌图、图片上传失败和组合图形渲染失败均报告位置，避免静默丢失。
+
+## Mac 原生 MLX 联调
+
+Apple Silicon / 24 GB；应用和 MLX 服务使用独立原生虚拟环境。布局在 Paddle CPU 上运行，VLM 在 MLX/Metal 上运行。完整锁文件为 `requirements-mac.lock.txt` 与 `requirements-mlx.lock.txt`，核心版本 PaddleOCR 3.7.0、PaddleX 3.7.2、Paddle CPU 3.2.2、MLX-VLM 0.3.11、MLX 0.30.6。
+
+```bash
+brew install uv
+brew install --cask libreoffice
+uv python install 3.12
+uv venv --python 3.12 .venv
+uv pip sync --python .venv/bin/python requirements-mac.lock.txt
+uv venv --python 3.12 .venv-mlx
+uv pip sync --python .venv-mlx/bin/python requirements-mlx.lock.txt
+.venv/bin/python scripts/prepare_models.py --license-file licenses/Apache-2.0.txt
 ```
 
-即使没有提取出图片，开启提图模式时也返回 `markdown`。响应不返回元素明细、坐标、图片列表、统计计数或成功标志；不再提供 `include_elements`、`include_metadata` 请求参数，未定义的请求参数返回 HTTP 422。
+权重来自官方公开仓库，VL 固定 revision `132c45f52c0a26ed5a6b2f6bd8e3985794cc27dd`，PP-DocLayoutV3 固定 revision `241f8bdfc77a7c7bee915a5057aaee58c235a8d3`。下载到 `var/models`，保存每个文件 SHA-256、模型卡及 Apache-2.0 许可证；不下载运行时未使用的评测样本。`MLX_MODEL_PATH` 默认指向这一固定版本的本地目录。
 
-只有处理范围截断、图片提取/上传不完整或识别失败时，才附带 `warnings`。正常完整处理时不返回该字段。例如只处理 325 页文档中的前 100 页：
+两个终端分别启动（官方 `mlx_vlm.server` 入口也可用，以下命令关闭开发热重载）：
 
-```json
-{
-  "markdown": "前 100 页的图文内容……",
-  "warnings": ["PDF contains 325 pages; only the first 100 pages were parsed"]
-}
+```bash
+.venv-mlx/bin/python -m uvicorn mlx_vlm.server:app --host 127.0.0.1 --port 8111
 ```
 
-`warnings` 不会混入 Markdown 正文；图片上传失败时不输出该图片的无效引用。完全无法下载或打开文档等错误仍通过 HTTP 状态码和 `detail` 返回。
+```bash
+PADDLEOCR_BACKEND=mlx MODEL_ROOT=./var/models \
+  MLX_SERVER_URL=http://127.0.0.1:8111/ .venv/bin/python -m app.main
+```
 
-Markdown 保留 Unstructured 文本元素的顺序，结合其内部页码、坐标及 PyMuPDF 图片位置插入图片引用，OCR 结果紧随对应图片。关闭提图时返回同一来源的纯文本。复杂多栏、表格、矢量图表不能保证完整恢复排版。文字统一使用 Unstructured `fast`，不运行本地 OCR。没有文本层的扫描 PDF 不会自动产生 OCR 文字。配置外部视觉服务并开启 `recognize_images` 后，才会识别图片内容。
+本机若运行 fake-IP VPN，系统 DNS 可能返回 `198.18.*` 基准测试地址。此时在应用启动命令前添加 `DOWNLOAD_DNS_OVER_HTTPS=https://cloudflare-dns.com/dns-query`。服务仍检查所有返回地址并固定连接到校验后的公共 IP，保留原始 Host、TLS SNI 和证书校验。生产环境默认使用系统 DNS。
 
-文档下载大小由 `.env` 的 `MAX_FILE_SIZE_MB` 控制（默认 50 MiB，修改后执行 `./run.sh` 生效），超限返回 HTTP 413。`max_image_bytes` 不会提高文档下载上限。提图同时受 `MAX_PDF_IMAGES`、`MAX_PDF_TOTAL_IMAGE_MB` 约束，超限或跳过图片时通过 `warnings` 告知。
+真实 OSS 验收仅从临时环境变量读取，不将签名链接写入仓库或镜像：
 
-图片存储使用 `StorageBackend`：默认写入本地持久卷，配置 `STORAGE_DRIVER=aliyun_oss` 和 `STORAGE_ALIYUN_OSS_*` 凭据后上传 OSS。上传并发由 `STORAGE_UPLOAD_CONCURRENCY` 控制，默认 4。对象键形如 `pdf-images/<uuid>/page-1-image-1`，不带扩展名；OSS 上传时按图片格式设置 `Content-Type`。密钥通过 `.env` 注入，不进入镜像、响应或日志。
+```bash
+# 在当前终端中安全设置完整链接，再执行；不要保存到项目文件。
+read -rs 'HUAHUO_TEST_FILE_URL?OSS signed URL: '
+export HUAHUO_TEST_FILE_URL
+.venv/bin/python scripts/smoke_api.py
+unset HUAHUO_TEST_FILE_URL
+```
 
-提图使用 PyMuPDF `Document.extract_image()` 直接提取嵌入资源，不进行整页渲染或统一转为 PNG。同一 PDF xref 只提取一次，超大资源跳过后不会再次调用 `extract_image()`；保留每个图片实例的页码和位置。同一内容的图片按 SHA-256 去重后只上传一次，不同位置的 Markdown 引用复用同一个对象键。
+脚本验证实际后端为 MLX、推理调用增加、PDF 页覆盖完整、原页码齐全及块坐标/尺寸存在，记录结果、Markdown 和耗时到忽略提交的 `var/acceptance/`。链接过期时换同一对象的新签名链接。服务日志不记录查询参数，urllib3 的请求目标 DEBUG 日志被禁用。
 
-当前不引入 PyMuPDF4LLM：它面向完整的 PDF/Markdown 和版面处理，文字来源已固定为 Unstructured 时没有必要再增加一套图文转换流程。评估时的 PyMuPDF4LLM 2.1 还绑定 PyMuPDF 2.1 和 `pymupdf_layout` 2.1，不符合当前仅提取嵌入图片、保持精简依赖的需求。
+## Linux / NVIDIA T4 镜像
 
-识别过滤默认使用原始宽高 64×64、页面显示面积比例 0.5%、SHA-256 精确去重和至少 3 页重复页眉/页脚启发式；过滤只控制识别调度，图片仍保留。`filter_images=false` 可关闭单次请求过滤，`IMAGE_SIZE_FILTER_ENABLED=false` 可关闭全局尺寸规则。
+目标 `ecs.gn6i-c4g1.xlarge`：linux/amd64、4 vCPU、15 GiB 内存、单张 T4 16 GB。Dockerfile 固定 Python 3.12.12 基础镜像 digest；GPU 依赖单独锁在 `requirements-linux.lock.txt`：Paddle GPU 3.2.2 的 CUDA 11.8 官方 wheel 固定 SHA-256，NVIDIA wheel 依赖固定 CUDA runtime 11.8.89、cuDNN 8.9.6.50 等版本。CUDA 运行库由这些 wheel 提供，容器宿主机需 NVIDIA 驱动和 NVIDIA Container Toolkit；不要求宿主机安装 CUDA toolkit。
 
-视觉适配器默认关闭。配置 `VISION_PROVIDER=http`、`VISION_API_URL`、`VISION_API_KEY`、`VISION_MODEL` 后，请求中设置 `recognize_images=true` 才会调用 OpenAI-compatible JSON 视觉接口。识别结果合并入 Markdown，不单独返回识别明细。默认不安装或运行本地 OCR、视觉模型。
+生产启动明确使用 `gpu:0`、`native`、`use_queues=True`，单进程一份模型、一个活跃文档任务，页面及视觉批次均为 1，CPU 线程为 4。T4 无 BF16 支持，Paddle 的原生识别器按设备能力选择 float32。CUDA 不可用时直接报错，不回落到 CPU。模型随镜像预置，运行时无需下载。Office 读取、LibreOffice、中文字体、PDF 渲染及 Markdown 拼装都在同一容器。
 
-FastAPI 文档：`/docs`；OpenAPI：`/openapi.json`。`.doc`/`.ppt`/`.xls` 可能需要系统转换工具或额外依赖，当前最小环境不自动安装 LibreOffice。错误响应不返回异常堆栈或服务器临时路径。
+`.dockerignore` 采用白名单，只有 app、Linux 锁文件、模型准备脚本和 Apache-2.0 许可证能进入构建上下文；最后镜像仅 COPY 应用、运行依赖和固定权重，不包含 `.env`、Mac 环境、样本、验收结果、OSS 链接或 Docker 登录文件。
+
+在 T4 主机运行已发布版本：
+
+```bash
+export DOCKERHUB_REPO=magiclaw/huahuo-parse
+export VERSION_TAG=vl16-20261110T075147Z-07fbffe
+docker compose pull
+docker compose up -d --no-build --wait --wait-timeout 600
+```
+
+也可直接运行：
+
+```bash
+docker run -d --name huahuo-parse --gpus all --shm-size=2g \
+  --cpus=4 --memory=14g -p 4763:4763 \
+  -v huahuo-parse-storage:/app/var/storage \
+  "${DOCKERHUB_REPO}:${VERSION_TAG}"
+```
+
+`./run.sh` 用于从源码构建和启动；`./stop.sh` 停止；`./restart.sh` 重启。配置沿用 `.env.example` 和可选 `.env`；生产可配置已有 OSS 存储。`/docs` 和 `/openapi.json` 提供当前接口定义。
+
+## 测试与公开发布
+
+```bash
+PRELOAD_MODEL=false .venv/bin/python -m unittest discover -s tests -v
+uv pip check --python .venv/bin/python
+uv pip check --python .venv-mlx/bin/python
+```
+
+旧版 32 项测试在迁移前已跑通；迁移后的回归复用原有下载失败/临时文件清理检查和动态 Office 样本，覆盖新请求契约、签名 URL、内容类型不符、101 页完整覆盖、官方跨页表格合并/歧义、HTML 表格图片、产物提交、公式缓存和图表备注。
+
+本次真实 325 页 OSS 样本、最终图片规则及测试记录见 [2026-11-10 验收记录](docs/acceptance-2026-11-10.md)。
+
+复用 Mac 已登录 Docker CLI，唯一标签发布并验证：
+
+```bash
+DOCKERHUB_REPO=magiclaw/huahuo-parse \
+  VERSION_TAG="vl16-$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD)" \
+  ./scripts/publish.sh
+```
+
+脚本实际执行 `docker buildx build --platform linux/amd64 --tag "$DOCKERHUB_REPO:$VERSION_TAG" --metadata-file var/release/build-metadata.json --push .`，随后查询 Docker Hub 公开属性、匿名拉取远端清单，并执行 `docker buildx imagetools inspect` 及 `--raw`，核对 digest 和 linux/amd64。记录保存在 `var/release/verification.json`，远端校验完成才算发布验收完成。
+
+2026-11-10 已完成公开发布与远端验收：
+
+- 镜像：`docker.io/magiclaw/huahuo-parse:vl16-20261110T075147Z-07fbffe`
+- Digest：`sha256:ca2faa5adf7e513cdc7276d2651c6d3438aaf048f47d5dba80118369e6e3dfa6`
+- 实际运行架构：`linux/amd64`；清单中的 `unknown/unknown` 项为构建来源证明。
+- 最终 `buildx --push` 退出码 0；公开属性、匿名清单/配置访问、远端内容哈希和本次 buildx digest 均通过核对。没有进行 T4 实机推理测试。
+
+网络中断时可用 `scripts/push_registry_chunks.py` 续传同一 OCI 构建产物，再运行发布脚本。它只使用现有 Docker Hub 登录态，不输出凭证或上传签名参数，按 SHA-256 校验导出层，最后才提交清单。完整实测及实际命令见上述验收记录。
+
+官方接口依据：[Apple Silicon 教程](https://www.paddleocr.ai/v3.6.0/en/version3.x/pipeline_usage/PaddleOCR-VL-Apple-Silicon.html)、[PaddleOCR-VL 完整流程](https://github.com/PaddlePaddle/PaddleOCR/blob/main/docs/version3.x/pipeline_usage/PaddleOCR-VL.en.md)、[官方 VL 权重](https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6)。
